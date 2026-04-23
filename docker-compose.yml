@@ -1,0 +1,49 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pikuai-backend-api
+    environment:
+      PORT: 4000
+      ADMIN_ORIGIN: http://localhost:5173
+      CORS_ORIGINS: http://localhost:8081,http://localhost:8082,http://localhost:19006
+      DATABASE_URL: postgresql://pikuai:pikuai_password@db:5432/pikuai
+      LLM_PROVIDER: ollama
+      LLM_ENABLED: "true"
+      LLM_BASE_URL: http://host.docker.internal:11434
+      LLM_MODEL: mistral:latest
+      LLM_TIMEOUT_SECONDS: 30
+      LLM_TEMPERATURE: 0.2
+      LLM_MAX_TOKENS: 280
+    command: uvicorn app.main:app --host 0.0.0.0 --port 4000 --reload
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    container_name: pikuai-backend-db
+    environment:
+      POSTGRES_DB: pikuai
+      POSTGRES_USER: pikuai
+      POSTGRES_PASSWORD: pikuai_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pikuai_postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pikuai -d pikuai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pikuai_postgres_data:

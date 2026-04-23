@@ -1,0 +1,14 @@
+node_modules
+__pycache__
+*.pyc
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.venv
+venv
+dist
+.git
+.env
+npm-debug.log
+Dockerfile
+docker-compose.yml
