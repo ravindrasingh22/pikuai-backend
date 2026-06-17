@@ -12,8 +12,10 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
   - `GUARDRAILS_ENABLED=true`
   - `GUARDRAILS_TEXT_NORMALIZATION_ENABLED=true`
   - `GUARDRAILS_TEXT_NORMALIZATION_URL=http://localhost:4002/api/v1/guardrail/text-normalization`
+  - `GUARDRAILS_CLASSIFIED_PROMPT_ENABLED=true`
   - `GUARDRAILS_CLASSIFIED_PROMPT_URL=http://localhost:4001/api/v1/guardrail/classified/prompt`
   - `GUARDRAILS_CHAT_URL=http://localhost:4003/api/v1/guardrail/chat`
+  - `GUARDRAILS_DEFAULT_SYSTEM_PROMPT` for chat generation when classified prompt is disabled or unavailable.
   - `GUARDRAILS_VALIDATOR_ENABLED=true`
   - `GUARDRAILS_VALIDATOR_URL=http://localhost:4002/api/v1/guardrail/validate`
   - `GUARDRAILS_VALIDATOR_THRESHOLD=0.85`
@@ -21,8 +23,9 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
 - Add admin panel controls for guardrails:
   - enable/disable full guardrails orchestration.
   - enable/disable text normalization with editable endpoint URL.
-  - configure classified prompt endpoint URL.
-  - configure chat endpoint URL.
+  - enable/disable classified prompt generation with editable endpoint URL.
+  - configure chat LLM endpoint URL; chat stays always enabled while guardrails orchestration is enabled.
+  - configure default backend system prompt used when classified prompt generation is disabled or unavailable.
   - enable/disable validator with editable endpoint URL and pass threshold.
   - configure generic fallback response returned when validation fails.
 - Admin configuration should be stored in backend DB and loaded by chat orchestration at runtime, with environment variables as defaults.
@@ -47,12 +50,14 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
   - The placeholder returns the default recent context as-is.
   - Send that default context to guardrails endpoints without adding separate context intelligence yet.
 - Classified prompt generation:
-  - Backend sends normalized text, child profile, session id, and curated/default context to `GUARDRAILS_CLASSIFIED_PROMPT_URL`.
+  - If enabled, backend sends normalized text, child profile, session id, and curated/default context to `GUARDRAILS_CLASSIFIED_PROMPT_URL`.
   - This endpoint is treated as the child-safe system prompt generator for the LLM.
   - Backend uses the returned `prompts` as the authoritative prompt payload for chat generation.
   - Backend stores `prompt_checklist` and full `classifier_output` for audit/admin reporting.
+  - If classified prompt generation is disabled or unavailable, backend builds chat `messages` with `GUARDRAILS_DEFAULT_SYSTEM_PROMPT` plus the normalized child message.
 - Chat generation:
-  - Backend builds the chat payload from classified prompt `prompts`.
+  - Chat generation stays enabled whenever guardrails orchestration is enabled.
+  - Backend builds the chat payload from classified prompt `prompts` when available; otherwise it uses the configured default system prompt.
   - Backend calls `GUARDRAILS_CHAT_URL` with `validate_response: false`.
   - Validation remains owned by backend orchestration so threshold/fallback behavior is consistent.
 - Validator:
@@ -370,7 +375,9 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
   - text normalization disabled skips normalization and uses raw input.
   - context curation placeholder returns default recent context unchanged.
   - classified prompt request uses normalized input, context, child profile, and session id.
-  - chat request uses returned classified prompt messages with `validate_response: false`.
+  - classified prompt disabled skips classified prompt endpoint and uses default backend system prompt.
+  - chat request uses returned classified prompt messages with `validate_response: false` when classified prompt is enabled.
+  - chat request uses default system prompt with `validate_response: false` when classified prompt is disabled.
   - validator enabled and passing threshold returns generated response.
   - validator enabled and below threshold returns configured generic fallback.
   - validator disabled returns generated response and records validation skipped.
@@ -384,6 +391,8 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
 - Admin verification:
   - guardrails orchestration can be enabled/disabled from admin.
   - text normalization checkbox and endpoint config save correctly.
+  - classified prompt checkbox and endpoint config save correctly.
+  - default chat system prompt config saves correctly.
   - validator threshold and fallback response config save correctly.
   - admin can inspect per-call classification, prompt, chat, validator, and token usage details.
 
@@ -392,7 +401,9 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
 - `pikuai-backend` owns orchestration and persistence.
 - Text normalization is an internal guardrails call made before classified prompt generation.
 - Context generation is intentionally separate and only a placeholder in this phase.
-- `GUARDRAILS_CLASSIFIED_PROMPT_URL` is the child-safe system prompt generator.
+- `GUARDRAILS_CLASSIFIED_PROMPT_URL` is the child-safe system prompt generator when classified prompt generation is enabled.
 - Backend does not rewrite the classified prompt safety instructions.
+- `GUARDRAILS_CHAT_URL` remains required and enabled while guardrails orchestration is enabled.
+- `GUARDRAILS_DEFAULT_SYSTEM_PROMPT` is used when classified prompt generation is disabled or unavailable.
 - Backend calls validator directly and owns threshold/fallback behavior.
 - Guardrails services are internal only; production access should be restricted by network boundary or service token.
