@@ -13,6 +13,8 @@ class GuardrailsRuntimeConfig(TypedDict):
     text_normalization_enabled: bool
     text_normalization_url: str
     text_normalization_system_prompt: str
+    context_enabled: bool
+    context_recent_message_limit: int
     classified_prompt_enabled: bool
     classified_prompt_url: str
     chat_url: str
@@ -73,7 +75,8 @@ def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
                 cursor.execute(
                     """
                     SELECT enabled, text_normalization_enabled, text_normalization_url,
-                           text_normalization_system_prompt, classified_prompt_enabled,
+                           text_normalization_system_prompt, context_enabled,
+                           context_recent_message_limit, classified_prompt_enabled,
                            classified_prompt_url, chat_url, default_system_prompt,
                            validator_enabled, validator_url, validator_threshold,
                            fallback_response, timeout_seconds
@@ -88,6 +91,8 @@ def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
                 "text_normalization_enabled": bool(row["text_normalization_enabled"]),
                 "text_normalization_url": str(row["text_normalization_url"]),
                 "text_normalization_system_prompt": str(row["text_normalization_system_prompt"] or DEFAULT_TEXT_NORMALIZATION_SYSTEM_PROMPT),
+                "context_enabled": bool(row["context_enabled"]),
+                "context_recent_message_limit": int(row["context_recent_message_limit"]),
                 "classified_prompt_enabled": bool(row["classified_prompt_enabled"]),
                 "classified_prompt_url": str(row["classified_prompt_url"]),
                 "chat_url": str(row["chat_url"]),
@@ -105,6 +110,8 @@ def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
         "text_normalization_enabled": settings.guardrails_text_normalization_enabled,
         "text_normalization_url": settings.guardrails_text_normalization_url,
         "text_normalization_system_prompt": settings.guardrails_text_normalization_system_prompt,
+        "context_enabled": settings.guardrails_context_enabled,
+        "context_recent_message_limit": settings.guardrails_context_recent_message_limit,
         "classified_prompt_enabled": settings.guardrails_classified_prompt_enabled,
         "classified_prompt_url": settings.guardrails_classified_prompt_url,
         "chat_url": settings.guardrails_chat_url,
@@ -123,6 +130,8 @@ def update_guardrails_runtime_config(updates: dict[str, Any]) -> dict[str, Any]:
         "text_normalization_enabled",
         "text_normalization_url",
         "text_normalization_system_prompt",
+        "context_enabled",
+        "context_recent_message_limit",
         "classified_prompt_enabled",
         "classified_prompt_url",
         "chat_url",
@@ -199,8 +208,12 @@ def orchestrate_guardrails_response(
         "raw_message": message,
     }
     child_profile = _child_profile_payload(child, language)
-    context = _context_placeholder(recent_messages)
+    context = _context_placeholder(recent_messages, config)
     metadata["context_placeholder"] = context
+    metadata["context_config"] = {
+        "enabled": config["context_enabled"],
+        "recent_message_limit": config["context_recent_message_limit"],
+    }
 
     normalized_message = message
     if config["text_normalization_enabled"]:
@@ -462,9 +475,12 @@ def _age_from_band(age_band: str) -> int:
     return int(parts[-1])
 
 
-def _context_placeholder(recent_messages: list[dict[str, Any]]) -> list[str]:
+def _context_placeholder(recent_messages: list[dict[str, Any]], config: GuardrailsRuntimeConfig) -> list[str]:
+    if not config["context_enabled"]:
+        return []
     context: list[str] = []
-    for row in recent_messages[-8:]:
+    limit = max(0, int(config["context_recent_message_limit"]))
+    for row in recent_messages[-limit:] if limit else []:
         sender = "Child" if row.get("sender_type") == "child" else "Assistant"
         text = str(row.get("rendered_text") or "").strip()
         if text:

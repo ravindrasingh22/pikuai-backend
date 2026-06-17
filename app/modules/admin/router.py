@@ -38,6 +38,8 @@ class GuardrailsConfigPatch(BaseModel):
     text_normalization_enabled: bool | None = None
     text_normalization_url: str | None = None
     text_normalization_system_prompt: str | None = None
+    context_enabled: bool | None = None
+    context_recent_message_limit: int | None = Field(default=None, ge=0, le=50)
     classified_prompt_enabled: bool | None = None
     classified_prompt_url: str | None = None
     chat_url: str | None = None
@@ -394,6 +396,8 @@ def list_guardrails_chat_calls(limit: int = 25) -> dict[str, object]:
                        message.child_profile_id::text,
                        message.message_text,
                        message.rendered_text,
+                       assistant.id::text AS assistant_message_id,
+                       assistant.rendered_text AS assistant_rendered_text,
                        message.policy_bucket,
                        message.safety_category,
                        message.moderation_status,
@@ -417,9 +421,19 @@ def list_guardrails_chat_calls(limit: int = 25) -> dict[str, object]:
                          '[]'::jsonb
                        ) AS token_usage
                 FROM chat_messages message
+                LEFT JOIN LATERAL (
+                    SELECT id, rendered_text
+                    FROM chat_messages candidate
+                    WHERE candidate.thread_id = message.thread_id
+                      AND candidate.parent_user_id = message.parent_user_id
+                      AND candidate.sender_type = 'assistant'
+                      AND candidate.created_at >= message.created_at
+                    ORDER BY candidate.created_at ASC
+                    LIMIT 1
+                ) assistant ON true
                 LEFT JOIN chat_guardrails_token_usage usage ON usage.message_id = message.id
                 WHERE message.sender_type = 'child'
-                GROUP BY message.id
+                GROUP BY message.id, assistant.id, assistant.rendered_text
                 ORDER BY message.created_at DESC
                 LIMIT %s
                 """,

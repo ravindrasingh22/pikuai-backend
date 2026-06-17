@@ -22,6 +22,8 @@ class Settings(BaseSettings):
         "Normalize the child's message for downstream safety classification. "
         "Fix obvious typos, spacing, casing, and punctuation while preserving the child's meaning, language, and safety signals."
     )
+    guardrails_context_enabled: bool = True
+    guardrails_context_recent_message_limit: int = 8
     guardrails_classified_prompt_enabled: bool = True
     guardrails_classified_prompt_url: str = "http://localhost:4001/api/v1/guardrail/classified/prompt"
     guardrails_chat_url: str = "http://localhost:4003/api/v1/guardrail/chat"

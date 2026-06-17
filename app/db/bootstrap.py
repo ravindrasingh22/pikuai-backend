@@ -114,6 +114,8 @@ def bootstrap_database() -> None:
                   text_normalization_enabled BOOLEAN NOT NULL DEFAULT true,
                   text_normalization_url TEXT NOT NULL,
                   text_normalization_system_prompt TEXT NOT NULL,
+                  context_enabled BOOLEAN NOT NULL DEFAULT true,
+                  context_recent_message_limit INTEGER NOT NULL DEFAULT 8,
                   classified_prompt_enabled BOOLEAN NOT NULL DEFAULT true,
                   classified_prompt_url TEXT NOT NULL,
                   chat_url TEXT NOT NULL,
@@ -127,6 +129,8 @@ def bootstrap_database() -> None:
                 )
                 """
             )
+            cursor.execute("ALTER TABLE guardrails_runtime_config ADD COLUMN IF NOT EXISTS context_enabled BOOLEAN NOT NULL DEFAULT true")
+            cursor.execute("ALTER TABLE guardrails_runtime_config ADD COLUMN IF NOT EXISTS context_recent_message_limit INTEGER NOT NULL DEFAULT 8")
             cursor.execute(
                 """
                 INSERT INTO guardrails_runtime_config (
@@ -135,6 +139,8 @@ def bootstrap_database() -> None:
                   text_normalization_enabled,
                   text_normalization_url,
                   text_normalization_system_prompt,
+                  context_enabled,
+                  context_recent_message_limit,
                   classified_prompt_enabled,
                   classified_prompt_url,
                   chat_url,
@@ -159,6 +165,8 @@ def bootstrap_database() -> None:
                   %s,
                   %s,
                   %s,
+                  %s,
+                  %s,
                   %s
                 )
                 ON CONFLICT (id) DO NOTHING
@@ -168,6 +176,8 @@ def bootstrap_database() -> None:
                     settings.guardrails_text_normalization_enabled,
                     settings.guardrails_text_normalization_url,
                     settings.guardrails_text_normalization_system_prompt,
+                    settings.guardrails_context_enabled,
+                    settings.guardrails_context_recent_message_limit,
                     settings.guardrails_classified_prompt_enabled,
                     settings.guardrails_classified_prompt_url,
                     settings.guardrails_chat_url,

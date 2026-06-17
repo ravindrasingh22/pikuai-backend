@@ -9,6 +9,8 @@ def _config(**overrides: Any) -> client.GuardrailsRuntimeConfig:
         "text_normalization_enabled": True,
         "text_normalization_url": "http://normalizer",
         "text_normalization_system_prompt": "normalize carefully",
+        "context_enabled": True,
+        "context_recent_message_limit": 8,
         "classified_prompt_enabled": True,
         "classified_prompt_url": "http://classifier",
         "chat_url": "http://chat",
@@ -151,3 +153,33 @@ def test_validator_disabled_returns_generated_answer(monkeypatch) -> None:
     assert "http://validator" not in called_urls
     assert result.answer_text == "generated answer"
     assert result.metadata["validator_skipped"] is True
+
+
+def test_context_disabled_sends_empty_recent_context(monkeypatch) -> None:
+    classifier_payloads: list[dict[str, Any]] = []
+
+    def fake_post(url: str, payload: dict[str, Any], config: client.GuardrailsRuntimeConfig) -> dict[str, Any]:
+        if url == "http://normalizer":
+            return {"normalized_text": payload["message"]}
+        if url == "http://classifier":
+            classifier_payloads.append(payload)
+            return {"prompts": [{"role": "system", "content": "system"}, {"role": "user", "content": payload["message"]}], "classifier_output": {}}
+        if url == "http://chat":
+            return {"answer_text": "generated answer"}
+        return {"response_validation": "Safe", "validation_score": 0.9}
+
+    monkeypatch.setattr(client, "get_guardrails_runtime_config", lambda: _config(context_enabled=False))
+    monkeypatch.setattr(client, "_post_json", fake_post)
+
+    result = client.orchestrate_guardrails_response(
+        child=_child(),
+        input_mode="text",
+        language="en",
+        matched_restricted_topic=None,
+        message="hello",
+        recent_messages=[{"sender_type": "child", "rendered_text": "Earlier question"}],
+        session_id="session-1",
+    )
+
+    assert classifier_payloads[0]["recent_context"] == []
+    assert result.metadata["context_config"]["enabled"] is False
