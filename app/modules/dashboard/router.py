@@ -26,12 +26,20 @@ def overview(claims: TokenClaims = Depends(require_parent_or_admin)) -> dict[str
             child_count = int(cursor.fetchone()["child_count"])
             cursor.execute(
                 """
-                SELECT plan_code
-                FROM subscriptions
-                WHERE parent_user_id = %s
-                  AND status = 'active'
-                ORDER BY created_at DESC
-                LIMIT 1
+                SELECT COALESCE(subscription.plan_code, 'starter') AS plan_code,
+                       plan.title AS plan_title,
+                       plan.allowed_child_count
+                FROM (SELECT %s::uuid AS parent_user_id) parent_scope
+                LEFT JOIN LATERAL (
+                  SELECT plan_code
+                  FROM subscriptions
+                  WHERE parent_user_id = parent_scope.parent_user_id
+                    AND status = 'active'
+                  ORDER BY created_at DESC
+                  LIMIT 1
+                ) subscription ON true
+                LEFT JOIN billing_plans plan
+                  ON plan.code = COALESCE(subscription.plan_code, 'starter')
                 """,
                 (parent_id,),
             )
@@ -59,6 +67,9 @@ def overview(claims: TokenClaims = Depends(require_parent_or_admin)) -> dict[str
         {
             "child_count": child_count,
             "current_plan": subscription["plan_code"] if subscription else "starter",
+            "current_plan_title": subscription["plan_title"] if subscription else "Starter - 1 child plan",
+            "allowed_child_count": int(subscription["allowed_child_count"] or 1) if subscription else 1,
+            "can_add_child": child_count < (int(subscription["allowed_child_count"] or 1) if subscription else 1),
             "weekly_sessions": 0,
             "pending_alerts": pending_alerts,
             "top_topics": [],

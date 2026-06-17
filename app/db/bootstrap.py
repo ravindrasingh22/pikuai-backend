@@ -102,7 +102,7 @@ def bootstrap_database() -> None:
                     settings.llm_timeout_seconds,
                     settings.llm_temperature,
                     settings.llm_max_tokens,
-                    "You are PikuAI, a child-safe learning assistant.\nAnswer the child's actual question first with useful content, then optional enrichment.\nUse factual accuracy where possible. Be warm, natural, and child-friendly without over-cute filler.\nDo not use generic filler such as 'that is interesting' when a real answer can be given.\nNever expose policy labels or moderation internals in final child text.\nFor unsafe or too-mature requests, avoid abrupt refusal when possible: soften, reduce detail, redirect safely,\nand suggest involving a trusted adult where appropriate.\nAge policy: {age_style_rule}\nAnswer mode policy: {answer_mode_rule}\nChild profile: name={child_name}, age_group={child_age_group}, gender={child_gender}, pattern={child_pattern}.",
+                    "You are PikuAI, a child-safe learning assistant.\nAnswer the child's actual question first with useful content, then optional enrichment.\nUse factual accuracy where possible. Be warm, natural, and child-friendly without over-cute filler.\nDo not use generic filler such as 'that is interesting' when a real answer can be given.\nNever expose policy labels or moderation internals in final child text.\nIn continuous discussion, do not use the child's name in every answer.\nUse the child's name only when it feels natural and adds warmth or clarity.\nFor unsafe or too-mature requests, avoid abrupt refusal when possible: soften, reduce detail, redirect safely,\nand suggest involving a trusted adult where appropriate.\nAge policy: {age_style_rule}\nAnswer mode policy: {answer_mode_rule}\nChild profile: name={child_name}, age_group={child_age_group}, gender={child_gender}, pattern={child_pattern}.",
                     "Conversation goal:\n{conversation_goal}\n\nResponse style:\n- category: {message_category}\n- answer_mode: {answer_mode}\n- language: {language}\n\nThread memory:\n- rolling_summary: {thread_summary}\n- topic_continuity: {topic_continuity}\n- unresolved_follow_up: {unresolved_follow_up}\n- emotional_hint: {emotional_hint}\n- observed_preferences: {observed_preferences}\n- recent_entities: {recent_entities}\n\nRecent turns (last useful turns only):\n{recent_turns}\n\nSafety metadata:\n- policy_bucket: {policy_bucket}\n- safety_category: {safety_category}\n\nCurrent child message:\n{message}\n\nAnswer instructions:\n1) Give the direct answer first.\n2) Keep age-appropriate depth.\n3) Keep tone warm and natural.\n4) Use continuity only if relevant.\n5) Do not include internal labels in final output.",
                 ),
             )
@@ -150,6 +150,18 @@ def bootstrap_database() -> None:
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS child_voice_usage_daily (
+                  child_profile_id UUID NOT NULL REFERENCES child_profiles(id) ON DELETE CASCADE,
+                  usage_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                  used_seconds INTEGER NOT NULL DEFAULT 0 CHECK (used_seconds >= 0),
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  PRIMARY KEY (child_profile_id, usage_date)
+                )
+                """
+            )
+            cursor.execute(
+                """
                 ALTER TABLE child_profiles
                 ADD CONSTRAINT child_profiles_age_band_check
                 CHECK (age_band IN ('3-5', '6-8', '9-11', '11-13', '14-17'))
@@ -189,6 +201,36 @@ def bootstrap_database() -> None:
                   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS billing_plans (
+                  code TEXT PRIMARY KEY,
+                  title TEXT NOT NULL,
+                  monthly_price_inr INTEGER NOT NULL DEFAULT 0,
+                  allowed_child_count INTEGER NOT NULL CHECK (allowed_child_count >= 1),
+                  features_json JSONB NOT NULL DEFAULT '[]',
+                  active BOOLEAN NOT NULL DEFAULT true,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO billing_plans (code, title, monthly_price_inr, allowed_child_count, features_json)
+                VALUES
+                  ('starter', 'Starter - 1 child plan', 299, 1, '["safe chat", "dashboard"]'::jsonb),
+                  ('family_plus', 'Family Plus - 2 child plan', 599, 2, '["alerts", "2FA", "summaries"]'::jsonb),
+                  ('family_max', 'Family Max - 4 child plan', 999, 4, '["advanced controls", "voice chat", "priority support"]'::jsonb)
+                ON CONFLICT (code) DO UPDATE SET
+                  title = EXCLUDED.title,
+                  monthly_price_inr = EXCLUDED.monthly_price_inr,
+                  allowed_child_count = EXCLUDED.allowed_child_count,
+                  features_json = EXCLUDED.features_json,
+                  active = true,
+                  updated_at = now()
                 """
             )
             cursor.execute(

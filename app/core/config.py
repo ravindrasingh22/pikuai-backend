@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-in-local-env"
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = 14400
-    refresh_token_days: int = 14
+    refresh_token_days: int = 30
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

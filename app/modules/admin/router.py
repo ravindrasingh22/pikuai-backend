@@ -26,6 +26,11 @@ class ChangeParentPasswordRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
 
 
+class ChangeParentPlanRequest(BaseModel):
+    plan_code: str = Field(min_length=1)
+    billing_cycle: str = "monthly"
+
+
 @router.post("/auth/login")
 def admin_login(payload: AdminLoginRequest) -> dict[str, object]:
     email = payload.email
@@ -129,11 +134,21 @@ def list_users() -> dict[str, object]:
 
                 cursor.execute(
                     """
-                    SELECT parent_user_id::text, plan_code, billing_cycle, status,
-                           starts_at::text, ends_at::text, auto_renew, payment_provider
-                    FROM subscriptions
-                    WHERE parent_user_id = ANY(%s::uuid[])
-                    ORDER BY created_at DESC
+                    SELECT DISTINCT ON (subscription.parent_user_id)
+                           subscription.parent_user_id::text,
+                           subscription.plan_code,
+                           plan.title AS plan_title,
+                           plan.allowed_child_count,
+                           subscription.billing_cycle,
+                           subscription.status,
+                           subscription.starts_at::text,
+                           subscription.ends_at::text,
+                           subscription.auto_renew,
+                           subscription.payment_provider
+                    FROM subscriptions AS subscription
+                    LEFT JOIN billing_plans plan ON plan.code = subscription.plan_code
+                    WHERE subscription.parent_user_id = ANY(%s::uuid[])
+                    ORDER BY subscription.parent_user_id, subscription.created_at DESC
                     """,
                     (parent_ids,),
                 )
@@ -190,6 +205,77 @@ def list_users() -> dict[str, object]:
             "total_parent_users": len(parent_users),
         }
     )
+
+
+@router.get("/billing/plans", dependencies=[Depends(require_admin)])
+def list_billing_plans() -> dict[str, object]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT code, title, monthly_price_inr, allowed_child_count,
+                       features_json AS features, active
+                FROM billing_plans
+                WHERE active = true
+                ORDER BY allowed_child_count ASC
+                """
+            )
+            plans = [dict(row) for row in cursor.fetchall()]
+    return envelope(plans)
+
+
+@router.post("/users/{parent_user_id}/subscription", dependencies=[Depends(require_admin)])
+def change_parent_subscription(parent_user_id: str, payload: ChangeParentPlanRequest) -> dict[str, object]:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT code, title, allowed_child_count
+                FROM billing_plans
+                WHERE code = %s
+                  AND active = true
+                """,
+                (payload.plan_code,),
+            )
+            plan = cursor.fetchone()
+            if plan is None:
+                raise ApiError("NOT_FOUND", "Billing plan was not found.", 404)
+
+            cursor.execute(
+                """
+                SELECT id::text
+                FROM parent_users
+                WHERE id = %s
+                  AND status <> 'deleted'
+                """,
+                (parent_user_id,),
+            )
+            parent = cursor.fetchone()
+            if parent is None:
+                raise ApiError("NOT_FOUND", "Parent user was not found.", 404)
+
+            cursor.execute(
+                """
+                INSERT INTO subscriptions (
+                  parent_user_id,
+                  plan_code,
+                  billing_cycle,
+                  status,
+                  auto_renew,
+                  payment_provider
+                )
+                VALUES (%s, %s, %s, 'active', true, 'admin')
+                RETURNING parent_user_id::text, plan_code, billing_cycle, status,
+                          auto_renew, starts_at::text, ends_at::text, updated_at::text
+                """,
+                (parent_user_id, payload.plan_code, payload.billing_cycle),
+            )
+            subscription = dict(cursor.fetchone())
+            subscription["plan_title"] = plan["title"]
+            subscription["allowed_child_count"] = plan["allowed_child_count"]
+        connection.commit()
+
+    return envelope(subscription, "Parent billing plan updated.")
 
 
 @router.post("/users/{parent_user_id}/reset-pin", dependencies=[Depends(require_admin)])

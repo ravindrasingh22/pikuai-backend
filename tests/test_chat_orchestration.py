@@ -56,6 +56,7 @@ def test_prompt_builder_includes_memory_and_safety_context() -> None:
     system_prompt = prompts[0]["content"]
     user_prompt = prompts[1]["content"]
     assert "Answer the child's actual question first" in system_prompt
+    assert "do not use the child's name in every answer" in system_prompt
     assert "Age policy" in system_prompt
     assert "Thread memory:" in user_prompt
     assert "Current child message:" in user_prompt

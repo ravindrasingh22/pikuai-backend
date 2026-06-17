@@ -22,31 +22,19 @@ def _parent_id(claims: TokenClaims) -> str:
 
 @router.get("/plans")
 def plans() -> dict[str, object]:
-    return envelope(
-        [
-            {
-                "code": "starter",
-                "name": "Starter",
-                "monthly_price_inr": 299,
-                "allowed_child_count": 1,
-                "features": ["safe chat", "dashboard"],
-            },
-            {
-                "code": "family_plus",
-                "name": "Family Plus",
-                "monthly_price_inr": 599,
-                "allowed_child_count": 3,
-                "features": ["alerts", "2FA", "summaries"],
-            },
-            {
-                "code": "family_max",
-                "name": "Family Max",
-                "monthly_price_inr": 999,
-                "allowed_child_count": 5,
-                "features": ["advanced controls", "voice later"],
-            },
-        ]
-    )
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT code, title AS name, monthly_price_inr, allowed_child_count,
+                       features_json AS features
+                FROM billing_plans
+                WHERE active = true
+                ORDER BY allowed_child_count ASC
+                """
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+    return envelope(rows)
 
 
 def _latest_subscription(parent_id: str) -> dict[str, object] | None:

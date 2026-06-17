@@ -37,7 +37,8 @@ class ChildPinPayload(BaseModel):
     pin: str = Field(pattern=r"^\d{4}$")
 
 
-PLAN_LIMITS = {"starter": 1, "family_plus": 3, "family_max": 5}
+class VoiceUsagePayload(BaseModel):
+    elapsed_seconds: int = Field(ge=0, le=3600)
 
 
 def _parent_id(claims: TokenClaims) -> str:
@@ -62,6 +63,42 @@ def _subscription_plan(parent_id: str) -> str:
             )
             row = cursor.fetchone()
     return str(row["plan_code"]) if row else "starter"
+
+
+def _plan_child_limit(plan_code: str) -> int:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT allowed_child_count
+                FROM billing_plans
+                WHERE code = %s
+                  AND active = true
+                """,
+                (plan_code,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute("SELECT allowed_child_count FROM billing_plans WHERE code = 'starter'")
+                row = cursor.fetchone()
+    return int(row["allowed_child_count"]) if row else 1
+
+
+def _daily_limit_seconds(child: object) -> int:
+    daily_minutes = int(child["daily_time_limit_minutes"] or 30)
+    return max(0, daily_minutes * 60)
+
+
+def _voice_usage_response(child: object, usage: object) -> dict[str, object]:
+    daily_limit_seconds = _daily_limit_seconds(child)
+    used_seconds = min(int(usage["used_seconds"] or 0), daily_limit_seconds)
+    return {
+        "child_profile_id": child["id"],
+        "usage_date": usage["usage_date"],
+        "daily_limit_seconds": daily_limit_seconds,
+        "used_seconds": used_seconds,
+        "remaining_seconds": max(0, daily_limit_seconds - used_seconds),
+    }
 
 
 @router.get("")
@@ -93,7 +130,7 @@ def list_children(claims: TokenClaims = Depends(require_parent_or_admin)) -> dic
 def create_child(payload: ChildPayload, claims: TokenClaims = Depends(require_parent_or_admin)) -> dict[str, object]:
     parent_id = _parent_id(claims)
     plan_code = _subscription_plan(parent_id)
-    limit = PLAN_LIMITS.get(plan_code, PLAN_LIMITS["starter"])
+    limit = _plan_child_limit(plan_code)
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -161,6 +198,84 @@ def get_child(child_id: str, claims: TokenClaims = Depends(require_parent_or_adm
     if child is None:
         raise ApiError("NOT_FOUND", "Child profile was not found.", 404)
     return envelope(dict(child))
+
+
+@router.get("/{child_id}/voice-usage")
+def get_child_voice_usage(child_id: str, claims: TokenClaims = Depends(require_parent_or_admin)) -> dict[str, object]:
+    parent_id = _parent_id(claims)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id::text, daily_time_limit_minutes
+                FROM child_profiles
+                WHERE id = %s
+                  AND parent_user_id = %s
+                  AND active_status = 'active'
+                """,
+                (child_id, parent_id),
+            )
+            child = cursor.fetchone()
+            if child is None:
+                raise ApiError("NOT_FOUND", "Child profile was not found.", 404)
+
+            cursor.execute(
+                """
+                SELECT CURRENT_DATE::text AS usage_date,
+                       COALESCE((
+                         SELECT used_seconds
+                         FROM child_voice_usage_daily
+                         WHERE child_profile_id = %s
+                           AND usage_date = CURRENT_DATE
+                       ), 0) AS used_seconds
+                """,
+                (child_id,),
+            )
+            usage = cursor.fetchone()
+
+    return envelope(_voice_usage_response(child, usage))
+
+
+@router.post("/{child_id}/voice-usage")
+def add_child_voice_usage(
+    child_id: str,
+    payload: VoiceUsagePayload,
+    claims: TokenClaims = Depends(require_parent_or_admin),
+) -> dict[str, object]:
+    parent_id = _parent_id(claims)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id::text, daily_time_limit_minutes
+                FROM child_profiles
+                WHERE id = %s
+                  AND parent_user_id = %s
+                  AND active_status = 'active'
+                """,
+                (child_id, parent_id),
+            )
+            child = cursor.fetchone()
+            if child is None:
+                raise ApiError("NOT_FOUND", "Child profile was not found.", 404)
+
+            daily_limit_seconds = _daily_limit_seconds(child)
+            cursor.execute(
+                """
+                INSERT INTO child_voice_usage_daily (child_profile_id, usage_date, used_seconds)
+                VALUES (%s, CURRENT_DATE, LEAST(%s, %s))
+                ON CONFLICT (child_profile_id, usage_date)
+                DO UPDATE SET
+                  used_seconds = LEAST(child_voice_usage_daily.used_seconds + EXCLUDED.used_seconds, %s),
+                  updated_at = now()
+                RETURNING CURRENT_DATE::text AS usage_date, used_seconds
+                """,
+                (child_id, payload.elapsed_seconds, daily_limit_seconds, daily_limit_seconds),
+            )
+            usage = cursor.fetchone()
+        connection.commit()
+
+    return envelope(_voice_usage_response(child, usage), "Voice usage updated.")
 
 
 @router.patch("/{child_id}")
