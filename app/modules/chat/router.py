@@ -4,6 +4,11 @@ from pydantic import BaseModel, Field
 
 from app.core.security import TokenClaims, require_parent_or_admin
 from app.db.session import get_connection
+from app.modules.guardrails.client import (
+    get_guardrails_runtime_config,
+    insert_token_usage,
+    orchestrate_guardrails_response,
+)
 from app.modules.chat.child_response_service import (
     ChildResponseContext,
     generate_child_response,
@@ -103,59 +108,119 @@ def create_message(payload: ChatMessageRequest, claims: TokenClaims = Depends(re
         (topic for topic in restricted_topics if topic and topic in payload.message.lower()),
         None,
     )
+    input_mode = "voice" if payload.input_mode_optional == "voice" else "text"
 
-    moderation = classify_input(payload.message)
-    if matched_restricted_topic and moderation["policy_bucket"] == "allowed":
-        moderation = {
-            "policy_bucket": "block_and_redirect",
-            "category": "parent_blocked_topic",
-            "severity": 80,
-            "reason_codes": [f"parent_blocked_topic:{matched_restricted_topic}"],
-        }
-
-    fallback_answer = render_answer(payload.message, str(child["age_band"]), moderation["policy_bucket"])
-    if moderation["policy_bucket"] in {"allowed", "allowed_with_adaptation"}:
-        response_orchestration = generate_child_response(
-            ChildResponseContext(
-                child_age_group=str(child["age_band"]),
-                child_gender=str(child.get("gender") or "not_disclosed"),
-                child_name=str(child["display_name"]),
-                child_pattern="curious",
+    guardrails_result = None
+    guardrails_error = None
+    try:
+        if get_guardrails_runtime_config()["enabled"]:
+            guardrails_result = orchestrate_guardrails_response(
+                child=dict(child),
+                input_mode=input_mode,
                 language=payload.language_optional or "en",
-                policy_bucket=moderation["policy_bucket"],
-                safety_category=moderation["category"],
-                requested_answer_mode=payload.answer_mode_optional,
-                fallback_text=fallback_answer,
+                matched_restricted_topic=matched_restricted_topic,
                 message=payload.message,
                 recent_messages=recent_messages,
-                previous_memory=previous_memory,
+                session_id=existing_thread_id or f"child-{child['id']}",
             )
-        )
-        llm_result = response_orchestration.llm
-        answer = llm_result["text"]
-    else:
-        response_orchestration = None
-        llm_result = {
-            "text": fallback_answer,
-            "provider": "policy_renderer",
-            "model": "deterministic_safety_response",
-            "used_fallback": False,
-            "error": None,
-        }
-        answer = fallback_answer
+    except Exception as exc:
+        guardrails_error = str(exc)
 
-    explanation_text = (
-        f"Input classified as {moderation['category']}; final bucket "
-        f"{moderation['policy_bucket']}; age band {child['age_band']}."
-    )
-    moderation_status = {
-        "allowed": "passed",
-        "allowed_with_adaptation": "adapted",
-        "block_and_redirect": "blocked",
-        "escalate": "escalated",
-    }[moderation["policy_bucket"]]
-    is_unsafe = moderation["policy_bucket"] in {"escalate", "block_and_redirect"}
-    input_mode = "voice" if payload.input_mode_optional == "voice" else "text"
+    if guardrails_result is not None:
+        response_orchestration = None
+        moderation = {
+            "policy_bucket": guardrails_result.policy_bucket,
+            "category": guardrails_result.safety_category,
+            "severity": 80 if guardrails_result.alert_created else 0,
+            "reason_codes": [guardrails_result.explanation_code],
+        }
+        llm_result = {
+            "text": guardrails_result.answer_text,
+            "provider": guardrails_result.llm_provider,
+            "model": guardrails_result.ai_model_used,
+            "used_fallback": guardrails_result.llm_used_fallback,
+            "error": guardrails_result.llm_error,
+        }
+        answer = guardrails_result.answer_text
+        explanation_text = guardrails_result.explanation_text
+        moderation_status = guardrails_result.moderation_status
+        is_unsafe = guardrails_result.alert_created or guardrails_result.policy_bucket in {"escalate", "block_and_redirect"}
+        answer_mode = guardrails_result.answer_mode
+        metadata_payload = {
+            "llm_provider": llm_result["provider"],
+            "llm_used_fallback": llm_result["used_fallback"],
+            "llm_error": llm_result["error"],
+            "unsafe_detected": is_unsafe,
+            "reason_codes": moderation["reason_codes"],
+            "input_mode": input_mode,
+            "guardrails": guardrails_result.metadata,
+            "guardrails_fallback_used": guardrails_result.fallback_used,
+            "guardrails_fallback_reason": guardrails_result.fallback_reason,
+        }
+    else:
+        moderation = classify_input(payload.message)
+        if matched_restricted_topic and moderation["policy_bucket"] == "allowed":
+            moderation = {
+                "policy_bucket": "block_and_redirect",
+                "category": "parent_blocked_topic",
+                "severity": 80,
+                "reason_codes": [f"parent_blocked_topic:{matched_restricted_topic}"],
+            }
+
+        fallback_answer = render_answer(payload.message, str(child["age_band"]), moderation["policy_bucket"])
+        if moderation["policy_bucket"] in {"allowed", "allowed_with_adaptation"}:
+            response_orchestration = generate_child_response(
+                ChildResponseContext(
+                    child_age_group=str(child["age_band"]),
+                    child_gender=str(child.get("gender") or "not_disclosed"),
+                    child_name=str(child["display_name"]),
+                    child_pattern="curious",
+                    language=payload.language_optional or "en",
+                    policy_bucket=moderation["policy_bucket"],
+                    safety_category=moderation["category"],
+                    requested_answer_mode=payload.answer_mode_optional,
+                    fallback_text=fallback_answer,
+                    message=payload.message,
+                    recent_messages=recent_messages,
+                    previous_memory=previous_memory,
+                )
+            )
+            llm_result = response_orchestration.llm
+            answer = llm_result["text"]
+        else:
+            response_orchestration = None
+            llm_result = {
+                "text": fallback_answer,
+                "provider": "policy_renderer",
+                "model": "deterministic_safety_response",
+                "used_fallback": False,
+                "error": None,
+            }
+            answer = fallback_answer
+
+        explanation_text = (
+            f"Input classified as {moderation['category']}; final bucket "
+            f"{moderation['policy_bucket']}; age band {child['age_band']}."
+        )
+        moderation_status = {
+            "allowed": "passed",
+            "allowed_with_adaptation": "adapted",
+            "block_and_redirect": "blocked",
+            "escalate": "escalated",
+        }[moderation["policy_bucket"]]
+        is_unsafe = moderation["policy_bucket"] in {"escalate", "block_and_redirect"}
+        answer_mode = response_orchestration.answer_mode if response_orchestration else "parent_safe_redirect"
+        metadata_payload = {
+            "llm_provider": llm_result["provider"],
+            "llm_used_fallback": llm_result["used_fallback"],
+            "llm_error": llm_result["error"],
+            "unsafe_detected": is_unsafe,
+            "reason_codes": moderation["reason_codes"],
+            "input_mode": input_mode,
+            **(response_metadata(response_orchestration) if response_orchestration else {}),
+        }
+        if guardrails_error:
+            metadata_payload["guardrails_error"] = guardrails_error
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -187,19 +252,9 @@ def create_message(payload: ChatMessageRequest, claims: TokenClaims = Depends(re
                 moderation_status,
                 moderation["reason_codes"][0],
                 explanation_text,
-                (response_orchestration.answer_mode if response_orchestration else "parent_safe_redirect"),
+                answer_mode,
                 llm_result["model"],
-                Jsonb(
-                    {
-                        "llm_provider": llm_result["provider"],
-                        "llm_used_fallback": llm_result["used_fallback"],
-                        "llm_error": llm_result["error"],
-                        "unsafe_detected": is_unsafe,
-                        "reason_codes": moderation["reason_codes"],
-                        "input_mode": input_mode,
-                        **(response_metadata(response_orchestration) if response_orchestration else {}),
-                    }
-                ),
+                Jsonb(metadata_payload),
             )
             cursor.execute(
                 """
@@ -288,6 +343,15 @@ def create_message(payload: ChatMessageRequest, claims: TokenClaims = Depends(re
                 (moderation["policy_bucket"], alert_id, thread_id),
             )
         connection.commit()
+
+    if guardrails_result is not None:
+        insert_token_usage(
+            child_profile_id=child["id"],
+            message_id=child_message_id,
+            parent_user_id=parent_id,
+            thread_id=thread_id,
+            usages=guardrails_result.token_usage,
+        )
 
     return envelope(
         {

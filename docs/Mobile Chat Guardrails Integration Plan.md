@@ -12,6 +12,7 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
   - `GUARDRAILS_ENABLED=true`
   - `GUARDRAILS_TEXT_NORMALIZATION_ENABLED=true`
   - `GUARDRAILS_TEXT_NORMALIZATION_URL=http://localhost:4002/api/v1/guardrail/text-normalization`
+  - `GUARDRAILS_TEXT_NORMALIZATION_SYSTEM_PROMPT` for the normalization instruction prompt.
   - `GUARDRAILS_CLASSIFIED_PROMPT_ENABLED=true`
   - `GUARDRAILS_CLASSIFIED_PROMPT_URL=http://localhost:4001/api/v1/guardrail/classified/prompt`
   - `GUARDRAILS_CHAT_URL=http://localhost:4003/api/v1/guardrail/chat`
@@ -23,6 +24,7 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
 - Add admin panel controls for guardrails:
   - enable/disable full guardrails orchestration.
   - enable/disable text normalization with editable endpoint URL.
+  - configure text normalization system prompt.
   - enable/disable classified prompt generation with editable endpoint URL.
   - configure chat LLM endpoint URL; chat stays always enabled while guardrails orchestration is enabled.
   - configure default backend system prompt used when classified prompt generation is disabled or unavailable.
@@ -40,8 +42,10 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
   - raw child input exactly as received.
 - Text normalization:
   - If enabled, backend calls `GUARDRAILS_TEXT_NORMALIZATION_URL` before classification/prompt generation.
+  - Backend sends the admin-configured text normalization system prompt with the normalization request.
   - This is required because children can type with spelling mistakes, mixed casing, punctuation issues, incomplete wording, code-mixed language, or other noisy input.
   - Backend preserves both raw input and normalized input in metadata.
+  - Backend preserves the text normalization system prompt version or prompt snapshot in metadata.
   - If text normalization is disabled, backend uses raw input as normalized input.
   - If text normalization fails, backend records the failure and uses raw input unless admin config requires fail-closed.
 - Context curation:
@@ -341,6 +345,7 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
 
 - Save stage metadata for every chat request:
   - raw child input.
+  - text normalization system prompt snapshot.
   - normalized child input.
   - context placeholder output.
   - classified prompt request and response.
@@ -372,6 +377,7 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
 
 - Backend unit tests:
   - text normalization enabled calls normalization endpoint before classified prompt.
+  - text normalization request includes the admin-configured system prompt.
   - text normalization disabled skips normalization and uses raw input.
   - context curation placeholder returns default recent context unchanged.
   - classified prompt request uses normalized input, context, child profile, and session id.
@@ -391,6 +397,7 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
 - Admin verification:
   - guardrails orchestration can be enabled/disabled from admin.
   - text normalization checkbox and endpoint config save correctly.
+  - text normalization system prompt config saves correctly.
   - classified prompt checkbox and endpoint config save correctly.
   - default chat system prompt config saves correctly.
   - validator threshold and fallback response config save correctly.
@@ -400,6 +407,7 @@ Final flow: mobile -> backend -> text normalization -> context curation placehol
 
 - `pikuai-backend` owns orchestration and persistence.
 - Text normalization is an internal guardrails call made before classified prompt generation.
+- Text normalization uses an admin-configurable system prompt supplied by backend.
 - Context generation is intentionally separate and only a placeholder in this phase.
 - `GUARDRAILS_CLASSIFIED_PROMPT_URL` is the child-safe system prompt generator when classified prompt generation is enabled.
 - Backend does not rewrite the classified prompt safety instructions.

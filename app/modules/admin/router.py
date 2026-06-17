@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends
+import httpx
 from pydantic import BaseModel, Field, field_validator
 
 from app.core.security import create_token, require_admin
 from app.db.session import get_connection
+from app.modules.guardrails.client import guardrails_public_config, update_guardrails_runtime_config
 from app.shared.envelope import envelope
 from app.shared.exceptions import ApiError
 
@@ -29,6 +31,22 @@ class ChangeParentPasswordRequest(BaseModel):
 class ChangeParentPlanRequest(BaseModel):
     plan_code: str = Field(min_length=1)
     billing_cycle: str = "monthly"
+
+
+class GuardrailsConfigPatch(BaseModel):
+    enabled: bool | None = None
+    text_normalization_enabled: bool | None = None
+    text_normalization_url: str | None = None
+    text_normalization_system_prompt: str | None = None
+    classified_prompt_enabled: bool | None = None
+    classified_prompt_url: str | None = None
+    chat_url: str | None = None
+    default_system_prompt: str | None = None
+    validator_enabled: bool | None = None
+    validator_url: str | None = None
+    validator_threshold: float | None = Field(default=None, ge=0, le=1)
+    fallback_response: str | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0, le=300)
 
 
 @router.post("/auth/login")
@@ -276,6 +294,139 @@ def change_parent_subscription(parent_user_id: str, payload: ChangeParentPlanReq
         connection.commit()
 
     return envelope(subscription, "Parent billing plan updated.")
+
+
+@router.get("/guardrails/config", dependencies=[Depends(require_admin)])
+def get_guardrails_config() -> dict[str, object]:
+    return envelope(guardrails_public_config())
+
+
+@router.patch("/guardrails/config", dependencies=[Depends(require_admin)])
+def patch_guardrails_config(payload: GuardrailsConfigPatch) -> dict[str, object]:
+    updates = payload.model_dump(exclude_unset=True)
+    for key in (
+        "text_normalization_url",
+        "classified_prompt_url",
+        "chat_url",
+        "validator_url",
+        "text_normalization_system_prompt",
+        "default_system_prompt",
+        "fallback_response",
+    ):
+        if key in updates and not str(updates[key]).strip():
+            raise ApiError("INVALID_GUARDRAILS_CONFIG", f"{key} cannot be empty.", 422)
+    return envelope(update_guardrails_runtime_config(updates), "Guardrails configuration updated.")
+
+
+@router.get("/guardrails/reachability", dependencies=[Depends(require_admin)])
+def test_guardrails_reachability() -> dict[str, object]:
+    config = guardrails_public_config()
+    timeout = min(float(config.get("timeout_seconds") or 30), 8)
+    checks = [
+        ("text_normalization", str(config["text_normalization_url"]), bool(config["text_normalization_enabled"])),
+        ("classified_prompt", str(config["classified_prompt_url"]), bool(config["classified_prompt_enabled"])),
+        ("chat", str(config["chat_url"]), True),
+        ("validator", str(config["validator_url"]), bool(config["validator_enabled"])),
+    ]
+    results = [_probe_guardrails_endpoint(name, url, enabled, timeout) for name, url, enabled in checks]
+    return envelope(
+        {
+            "ok": all(result["reachable"] or result["skipped"] for result in results),
+            "results": results,
+        }
+    )
+
+
+def _probe_guardrails_endpoint(name: str, url: str, enabled: bool, timeout: float) -> dict[str, object]:
+    if not enabled:
+        return {
+            "name": name,
+            "url": url,
+            "enabled": enabled,
+            "reachable": False,
+            "skipped": True,
+            "status_code": None,
+            "error": None,
+        }
+    health_url = _health_url(url)
+    try:
+        response = httpx.get(health_url, timeout=timeout)
+        return {
+            "name": name,
+            "url": url,
+            "enabled": enabled,
+            "reachable": response.status_code < 500,
+            "skipped": False,
+            "status_code": response.status_code,
+            "health_url": health_url,
+            "error": None if response.status_code < 500 else response.text[:240],
+        }
+    except Exception as exc:
+        return {
+            "name": name,
+            "url": url,
+            "enabled": enabled,
+            "reachable": False,
+            "skipped": False,
+            "status_code": None,
+            "health_url": health_url,
+            "error": str(exc),
+        }
+
+
+def _health_url(url: str) -> str:
+    marker = "/api/v1/"
+    if marker in url:
+        return f"{url.split(marker, 1)[0].rstrip('/')}/health"
+    return f"{url.rstrip('/')}/health"
+
+
+@router.get("/guardrails/chat-calls", dependencies=[Depends(require_admin)])
+def list_guardrails_chat_calls(limit: int = 25) -> dict[str, object]:
+    bounded_limit = max(1, min(limit, 100))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT message.id::text,
+                       message.thread_id::text,
+                       message.parent_user_id::text,
+                       message.child_profile_id::text,
+                       message.message_text,
+                       message.rendered_text,
+                       message.policy_bucket,
+                       message.safety_category,
+                       message.moderation_status,
+                       message.explanation_text,
+                       message.ai_model_used,
+                       message.metadata_json,
+                       message.created_at::text,
+                       COALESCE(
+                         jsonb_agg(
+                           jsonb_build_object(
+                             'stage_name', usage.stage_name,
+                             'provider', usage.provider,
+                             'model', usage.model,
+                             'prompt_tokens', usage.prompt_tokens,
+                             'completion_tokens', usage.completion_tokens,
+                             'total_tokens', usage.total_tokens,
+                             'created_at', usage.created_at::text
+                           )
+                           ORDER BY usage.created_at ASC
+                         ) FILTER (WHERE usage.id IS NOT NULL),
+                         '[]'::jsonb
+                       ) AS token_usage
+                FROM chat_messages message
+                LEFT JOIN chat_guardrails_token_usage usage ON usage.message_id = message.id
+                WHERE message.sender_type = 'child'
+                GROUP BY message.id
+                ORDER BY message.created_at DESC
+                LIMIT %s
+                """,
+                (bounded_limit,),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+    return envelope(rows)
 
 
 @router.post("/users/{parent_user_id}/reset-pin", dependencies=[Depends(require_admin)])

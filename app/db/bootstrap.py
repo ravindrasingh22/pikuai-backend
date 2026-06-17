@@ -108,6 +108,79 @@ def bootstrap_database() -> None:
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS guardrails_runtime_config (
+                  id BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
+                  enabled BOOLEAN NOT NULL DEFAULT true,
+                  text_normalization_enabled BOOLEAN NOT NULL DEFAULT true,
+                  text_normalization_url TEXT NOT NULL,
+                  text_normalization_system_prompt TEXT NOT NULL,
+                  classified_prompt_enabled BOOLEAN NOT NULL DEFAULT true,
+                  classified_prompt_url TEXT NOT NULL,
+                  chat_url TEXT NOT NULL,
+                  default_system_prompt TEXT NOT NULL,
+                  validator_enabled BOOLEAN NOT NULL DEFAULT true,
+                  validator_url TEXT NOT NULL,
+                  validator_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.85,
+                  fallback_response TEXT NOT NULL,
+                  timeout_seconds DOUBLE PRECISION NOT NULL DEFAULT 30,
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO guardrails_runtime_config (
+                  id,
+                  enabled,
+                  text_normalization_enabled,
+                  text_normalization_url,
+                  text_normalization_system_prompt,
+                  classified_prompt_enabled,
+                  classified_prompt_url,
+                  chat_url,
+                  default_system_prompt,
+                  validator_enabled,
+                  validator_url,
+                  validator_threshold,
+                  fallback_response,
+                  timeout_seconds
+                )
+                VALUES (
+                  true,
+                  %s,
+                  %s,
+                  %s,
+                  %s,
+                  %s,
+                  %s,
+                  %s,
+                  %s,
+                  %s,
+                  %s,
+                  %s,
+                  %s,
+                  %s
+                )
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (
+                    settings.guardrails_enabled,
+                    settings.guardrails_text_normalization_enabled,
+                    settings.guardrails_text_normalization_url,
+                    settings.guardrails_text_normalization_system_prompt,
+                    settings.guardrails_classified_prompt_enabled,
+                    settings.guardrails_classified_prompt_url,
+                    settings.guardrails_chat_url,
+                    settings.guardrails_default_system_prompt,
+                    settings.guardrails_validator_enabled,
+                    settings.guardrails_validator_url,
+                    settings.guardrails_validator_threshold,
+                    settings.guardrails_fallback_response,
+                    settings.guardrails_timeout_seconds,
+                ),
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS child_profiles (
                   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                   parent_user_id UUID NOT NULL REFERENCES parent_users(id) ON DELETE CASCADE,
@@ -290,8 +363,33 @@ def bootstrap_database() -> None:
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS chat_guardrails_token_usage (
+                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                  parent_user_id UUID NOT NULL REFERENCES parent_users(id) ON DELETE CASCADE,
+                  child_profile_id UUID NOT NULL REFERENCES child_profiles(id) ON DELETE CASCADE,
+                  thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                  message_id UUID NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+                  stage_name TEXT NOT NULL,
+                  provider TEXT,
+                  model TEXT,
+                  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                  completion_tokens INTEGER NOT NULL DEFAULT 0,
+                  total_tokens INTEGER NOT NULL DEFAULT 0,
+                  metadata_json JSONB NOT NULL DEFAULT '{}',
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cursor.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_chat_threads_parent_child
                 ON chat_threads(parent_user_id, child_profile_id, updated_at DESC)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_guardrails_token_usage_message
+                ON chat_guardrails_token_usage(message_id, stage_name)
                 """
             )
             cursor.execute(
