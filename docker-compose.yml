@@ -7,7 +7,7 @@ services:
     environment:
       PORT: 4000
       ADMIN_ORIGIN: http://localhost:5173
-      CORS_ORIGINS: http://localhost:8081,http://localhost:8082,http://localhost:19006
+      CORS_ORIGINS: http://localhost:8081,http://localhost:8082,http://localhost:19006,http://platform.pepiko.local:8080,http://internal.pepiko.local:8080
       DATABASE_URL: postgresql://pikuai:pikuai_password@db:5432/pikuai
       LLM_PROVIDER: ollama
       LLM_ENABLED: "true"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, TypedDict
+from typing import Any, Mapping, TypedDict
 
 import httpx
 
@@ -15,6 +15,10 @@ class GuardrailsRuntimeConfig(TypedDict):
     text_normalization_system_prompt: str
     context_enabled: bool
     context_recent_message_limit: int
+    context_to_text_normalization_enabled: bool
+    context_to_classified_prompt_enabled: bool
+    context_to_chat_enabled: bool
+    context_to_validator_enabled: bool
     classified_prompt_enabled: bool
     classified_prompt_url: str
     chat_url: str
@@ -76,7 +80,12 @@ def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
                     """
                     SELECT enabled, text_normalization_enabled, text_normalization_url,
                            text_normalization_system_prompt, context_enabled,
-                           context_recent_message_limit, classified_prompt_enabled,
+                           context_recent_message_limit,
+                           context_to_text_normalization_enabled,
+                           context_to_classified_prompt_enabled,
+                           context_to_chat_enabled,
+                           context_to_validator_enabled,
+                           classified_prompt_enabled,
                            classified_prompt_url, chat_url, default_system_prompt,
                            validator_enabled, validator_url, validator_threshold,
                            fallback_response, timeout_seconds
@@ -93,6 +102,10 @@ def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
                 "text_normalization_system_prompt": str(row["text_normalization_system_prompt"] or DEFAULT_TEXT_NORMALIZATION_SYSTEM_PROMPT),
                 "context_enabled": bool(row["context_enabled"]),
                 "context_recent_message_limit": int(row["context_recent_message_limit"]),
+                "context_to_text_normalization_enabled": bool(row["context_to_text_normalization_enabled"]),
+                "context_to_classified_prompt_enabled": bool(row["context_to_classified_prompt_enabled"]),
+                "context_to_chat_enabled": bool(row["context_to_chat_enabled"]),
+                "context_to_validator_enabled": bool(row["context_to_validator_enabled"]),
                 "classified_prompt_enabled": bool(row["classified_prompt_enabled"]),
                 "classified_prompt_url": str(row["classified_prompt_url"]),
                 "chat_url": str(row["chat_url"]),
@@ -112,6 +125,10 @@ def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
         "text_normalization_system_prompt": settings.guardrails_text_normalization_system_prompt,
         "context_enabled": settings.guardrails_context_enabled,
         "context_recent_message_limit": settings.guardrails_context_recent_message_limit,
+        "context_to_text_normalization_enabled": settings.guardrails_context_to_text_normalization_enabled,
+        "context_to_classified_prompt_enabled": settings.guardrails_context_to_classified_prompt_enabled,
+        "context_to_chat_enabled": settings.guardrails_context_to_chat_enabled,
+        "context_to_validator_enabled": settings.guardrails_context_to_validator_enabled,
         "classified_prompt_enabled": settings.guardrails_classified_prompt_enabled,
         "classified_prompt_url": settings.guardrails_classified_prompt_url,
         "chat_url": settings.guardrails_chat_url,
@@ -132,6 +149,10 @@ def update_guardrails_runtime_config(updates: dict[str, Any]) -> dict[str, Any]:
         "text_normalization_system_prompt",
         "context_enabled",
         "context_recent_message_limit",
+        "context_to_text_normalization_enabled",
+        "context_to_classified_prompt_enabled",
+        "context_to_chat_enabled",
+        "context_to_validator_enabled",
         "classified_prompt_enabled",
         "classified_prompt_url",
         "chat_url",
@@ -213,6 +234,16 @@ def orchestrate_guardrails_response(
     metadata["context_config"] = {
         "enabled": config["context_enabled"],
         "recent_message_limit": config["context_recent_message_limit"],
+        "to_text_normalization_enabled": config["context_to_text_normalization_enabled"],
+        "to_classified_prompt_enabled": config["context_to_classified_prompt_enabled"],
+        "to_chat_enabled": config["context_to_chat_enabled"],
+        "to_validator_enabled": config["context_to_validator_enabled"],
+    }
+    metadata["context_stage_delivery"] = {
+        "text_normalization": _context_stage_enabled(config, "context_to_text_normalization_enabled"),
+        "classified_prompt": _context_stage_enabled(config, "context_to_classified_prompt_enabled"),
+        "chat": _context_stage_enabled(config, "context_to_chat_enabled"),
+        "validator": _context_stage_enabled(config, "context_to_validator_enabled"),
     }
 
     normalized_message = message
@@ -222,7 +253,7 @@ def orchestrate_guardrails_response(
             "message": message,
             "child_profile": child_profile,
             "session_id": session_id,
-            "recent_context": context,
+            "recent_context": _stage_context(context, config, "context_to_text_normalization_enabled"),
         }
         metadata["text_normalization_request"] = normalization_request
         metadata["text_normalization_system_prompt"] = config["text_normalization_system_prompt"]
@@ -244,7 +275,7 @@ def orchestrate_guardrails_response(
         classified_prompt_request = {
             "child_profile": child_profile,
             "session_id": session_id,
-            "recent_context": context,
+            "recent_context": _stage_context(context, config, "context_to_classified_prompt_enabled"),
             "message": normalized_message,
         }
         metadata["classified_prompt_request"] = classified_prompt_request
@@ -266,6 +297,8 @@ def orchestrate_guardrails_response(
             {"role": "user", "content": normalized_message},
         ]
         metadata["default_system_prompt_used"] = True
+    if _context_stage_enabled(config, "context_to_chat_enabled"):
+        prompts = _prompts_with_chat_context(prompts, context)
     metadata["selected_prompts"] = prompts
 
     chat_request = {
@@ -314,6 +347,8 @@ def orchestrate_guardrails_response(
             "child_profile": child_profile,
             "session_id": session_id,
         }
+        if _context_stage_enabled(config, "context_to_validator_enabled"):
+            validator_request["recent_context"] = context
         metadata["validator_request"] = validator_request
         try:
             validator_response = _post_json(config["validator_url"], validator_request, config)
@@ -473,6 +508,48 @@ def _age_from_band(age_band: str) -> int:
     if not parts:
         return 10
     return int(parts[-1])
+
+
+def _context_stage_enabled(config: Mapping[str, Any], stage_key: str) -> bool:
+    return bool(config["context_enabled"] and config[stage_key])
+
+
+def _stage_context(
+    context: list[str],
+    config: Mapping[str, Any],
+    stage_key: str,
+) -> list[str]:
+    if not _context_stage_enabled(config, stage_key):
+        return []
+    return context
+
+
+def _prompts_with_chat_context(
+    prompts: list[dict[str, str]],
+    context: list[str],
+) -> list[dict[str, str]]:
+    if not context:
+        return prompts
+    context_block = "\n".join(f"- {item}" for item in context if item.strip())
+    if not context_block:
+        return prompts
+
+    system_suffix = (
+        "\n\nRecent conversation context for continuity and safety:\n"
+        f"{context_block}\n"
+        "Use this context only when it is relevant. Do not reveal internal safety or routing details."
+    )
+    updated: list[dict[str, str]] = []
+    appended = False
+    for prompt in prompts:
+        if not appended and prompt.get("role") == "system":
+            updated.append({**prompt, "content": f"{prompt.get('content', '').rstrip()}{system_suffix}"})
+            appended = True
+        else:
+            updated.append(dict(prompt))
+    if appended:
+        return updated
+    return [{"role": "system", "content": system_suffix.strip()}, *updated]
 
 
 def _context_placeholder(recent_messages: list[dict[str, Any]], config: GuardrailsRuntimeConfig) -> list[str]:

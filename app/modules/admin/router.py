@@ -40,6 +40,10 @@ class GuardrailsConfigPatch(BaseModel):
     text_normalization_system_prompt: str | None = None
     context_enabled: bool | None = None
     context_recent_message_limit: int | None = Field(default=None, ge=0, le=50)
+    context_to_text_normalization_enabled: bool | None = None
+    context_to_classified_prompt_enabled: bool | None = None
+    context_to_chat_enabled: bool | None = None
+    context_to_validator_enabled: bool | None = None
     classified_prompt_enabled: bool | None = None
     classified_prompt_url: str | None = None
     chat_url: str | None = None

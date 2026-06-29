@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     )
     guardrails_context_enabled: bool = True
     guardrails_context_recent_message_limit: int = 8
+    guardrails_context_to_text_normalization_enabled: bool = True
+    guardrails_context_to_classified_prompt_enabled: bool = True
+    guardrails_context_to_chat_enabled: bool = False
+    guardrails_context_to_validator_enabled: bool = False
     guardrails_classified_prompt_enabled: bool = True
     guardrails_classified_prompt_url: str = "http://localhost:4001/api/v1/guardrail/classified/prompt"
     guardrails_chat_url: str = "http://localhost:4003/api/v1/guardrail/chat"
