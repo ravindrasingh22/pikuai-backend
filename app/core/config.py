@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = 14400
     refresh_token_days: int = 30
+    smtp_host: str = "smtp-relay.brevo.com"
+    smtp_port: int = 587
+    smtp_secure: bool = False
+    smtp_user: str = "your_brevo_smtp_login"
+    smtp_pass: str = "your_brevo_smtp_key"
+    mail_from: str = "Pratvim Local <your_verified_sender_email>"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

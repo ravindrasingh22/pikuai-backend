@@ -3,6 +3,7 @@ from pydantic import BaseModel
 
 from app.core.security import TokenClaims, require_parent_or_admin
 from app.db.session import get_connection
+from app.modules.mail.service import send_template_email
 from app.shared.envelope import envelope
 from app.shared.exceptions import ApiError
 
@@ -55,6 +56,14 @@ def _latest_subscription(parent_id: str) -> dict[str, object] | None:
     return dict(subscription) if subscription else None
 
 
+def _parent_contact(parent_id: str) -> dict[str, object] | None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT full_name, email FROM parent_users WHERE id = %s", (parent_id,))
+            parent = cursor.fetchone()
+    return dict(parent) if parent else None
+
+
 @router.get("/subscription")
 def subscription(claims: TokenClaims = Depends(require_parent_or_admin)) -> dict[str, object]:
     parent_id = _parent_id(claims)
@@ -92,6 +101,19 @@ def checkout_session(payload: CheckoutPayload, claims: TokenClaims = Depends(req
                 (parent_id, payload.plan_code, payload.billing_cycle),
             )
         connection.commit()
+    parent_contact = _parent_contact(parent_id)
+    if parent_contact is not None:
+        send_template_email(
+            "billing_family_plan_active_parent",
+            str(parent_contact["email"]),
+            {
+                "parent_first_name": str(parent_contact["full_name"]).split(" ", 1)[0],
+                "parent_email": parent_contact["email"],
+                "plan_code": payload.plan_code,
+                "cta_link": "pratvim://parent/billing",
+            },
+            to_name=str(parent_contact["full_name"]),
+        )
     return envelope(
         {
             "checkout_session_id": "checkout_demo",
@@ -127,6 +149,19 @@ def update_subscription(payload: CheckoutPayload, claims: TokenClaims = Depends(
             )
             subscription_record = cursor.fetchone()
         connection.commit()
+    parent_contact = _parent_contact(parent_id)
+    if parent_contact is not None:
+        send_template_email(
+            "billing_family_plan_active_parent",
+            str(parent_contact["email"]),
+            {
+                "parent_first_name": str(parent_contact["full_name"]).split(" ", 1)[0],
+                "parent_email": parent_contact["email"],
+                "plan_code": payload.plan_code,
+                "cta_link": "pratvim://parent/billing",
+            },
+            to_name=str(parent_contact["full_name"]),
+        )
     return envelope(dict(subscription_record), "Subscription updated.")
 
 
@@ -155,4 +190,16 @@ def cancel_subscription(claims: TokenClaims = Depends(require_parent_or_admin)) 
             )
             subscription_record = cursor.fetchone()
         connection.commit()
+    parent_contact = _parent_contact(parent_id)
+    if parent_contact is not None:
+        send_template_email(
+            "billing_subscription_cancelled_parent",
+            str(parent_contact["email"]),
+            {
+                "parent_first_name": str(parent_contact["full_name"]).split(" ", 1)[0],
+                "parent_email": parent_contact["email"],
+                "cta_link": "pratvim://parent/billing",
+            },
+            to_name=str(parent_contact["full_name"]),
+        )
     return envelope(dict(subscription_record) if subscription_record else None, "Subscription canceled.")

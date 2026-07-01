@@ -22,6 +22,8 @@ class GuardrailsRuntimeConfig(TypedDict):
     classified_prompt_enabled: bool
     classified_prompt_url: str
     chat_url: str
+    api_key_optional: str | None
+    api_key_set: bool
     default_system_prompt: str
     validator_enabled: bool
     validator_url: str
@@ -67,7 +69,10 @@ DEFAULT_GUARDRAILS_SYSTEM_PROMPT = settings.guardrails_default_system_prompt
 
 
 def guardrails_public_config() -> dict[str, Any]:
-    return get_guardrails_runtime_config()
+    config = dict(get_guardrails_runtime_config())
+    api_key = config.pop("api_key_optional", None)
+    config["api_key_set"] = bool(api_key)
+    return config
 
 
 def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
@@ -86,7 +91,8 @@ def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
                            context_to_chat_enabled,
                            context_to_validator_enabled,
                            classified_prompt_enabled,
-                           classified_prompt_url, chat_url, default_system_prompt,
+                           classified_prompt_url, chat_url, api_key_optional,
+                           default_system_prompt,
                            validator_enabled, validator_url, validator_threshold,
                            fallback_response, timeout_seconds
                     FROM guardrails_runtime_config
@@ -109,6 +115,8 @@ def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
                 "classified_prompt_enabled": bool(row["classified_prompt_enabled"]),
                 "classified_prompt_url": str(row["classified_prompt_url"]),
                 "chat_url": str(row["chat_url"]),
+                "api_key_optional": str(row["api_key_optional"]) if row["api_key_optional"] else None,
+                "api_key_set": bool(row["api_key_optional"]),
                 "default_system_prompt": str(row["default_system_prompt"] or DEFAULT_GUARDRAILS_SYSTEM_PROMPT),
                 "validator_enabled": bool(row["validator_enabled"]),
                 "validator_url": str(row["validator_url"]),
@@ -132,6 +140,8 @@ def get_guardrails_runtime_config() -> GuardrailsRuntimeConfig:
         "classified_prompt_enabled": settings.guardrails_classified_prompt_enabled,
         "classified_prompt_url": settings.guardrails_classified_prompt_url,
         "chat_url": settings.guardrails_chat_url,
+        "api_key_optional": None,
+        "api_key_set": False,
         "default_system_prompt": settings.guardrails_default_system_prompt,
         "validator_enabled": settings.guardrails_validator_enabled,
         "validator_url": settings.guardrails_validator_url,
@@ -156,6 +166,7 @@ def update_guardrails_runtime_config(updates: dict[str, Any]) -> dict[str, Any]:
         "classified_prompt_enabled",
         "classified_prompt_url",
         "chat_url",
+        "api_key_optional",
         "default_system_prompt",
         "validator_enabled",
         "validator_url",
@@ -488,10 +499,18 @@ def _fallback_result(
 
 
 def _post_json(url: str, payload: dict[str, Any], config: GuardrailsRuntimeConfig) -> dict[str, Any]:
-    response = httpx.post(url, json=payload, timeout=config["timeout_seconds"])
+    headers = _guardrails_headers(config)
+    response = httpx.post(url, json=payload, headers=headers, timeout=config["timeout_seconds"])
     response.raise_for_status()
     data = response.json()
     return data if isinstance(data, dict) else {"data": data}
+
+
+def _guardrails_headers(config: Mapping[str, Any]) -> dict[str, str] | None:
+    api_key = str(config.get("api_key_optional") or "").strip()
+    if not api_key:
+        return None
+    return {"x-api-key": api_key}
 
 
 def _child_profile_payload(child: dict[str, Any], language: str) -> dict[str, Any]:

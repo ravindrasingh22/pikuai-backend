@@ -3,12 +3,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: pikuai-backend-api
+    container_name: pratvim-backend-api
     environment:
       PORT: 4000
       ADMIN_ORIGIN: http://localhost:5173
       CORS_ORIGINS: http://localhost:8081,http://localhost:8082,http://localhost:19006,http://platform.pepiko.local:8080,http://internal.pepiko.local:8080
-      DATABASE_URL: postgresql://pikuai:pikuai_password@db:5432/pikuai
+      DATABASE_URL: postgresql://pratvim:pikuai_password@db:5432/pratvim
       LLM_PROVIDER: ollama
       LLM_ENABLED: "true"
       LLM_BASE_URL: http://host.docker.internal:11434
@@ -28,22 +28,21 @@ services:
 
   db:
     image: postgres:16-alpine
-    container_name: pikuai-backend-db
+    container_name: pratvim-backend-db
     environment:
-      POSTGRES_DB: pikuai
-      POSTGRES_USER: pikuai
+      POSTGRES_DB: pratvim
+      POSTGRES_USER: pratvim
       POSTGRES_PASSWORD: pikuai_password
     ports:
       - "5432:5432"
     volumes:
-      - pikuai_postgres_data:/var/lib/postgresql/data
+      - ./pratvim_postgres_data:/var/lib/postgresql/data
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pikuai -d pikuai"]
+      test: ["CMD-SHELL", "pg_isready -U pratvim -d pratvim"]
       interval: 5s
       timeout: 5s
       retries: 10
     restart: unless-stopped
 
-volumes:
-  pikuai_postgres_data:
+

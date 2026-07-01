@@ -8,3 +8,8 @@ venv/
 node_modules/
 dist/
 .env
+pratvim_postgres_data/*
+pratvim_postgres_data
+
+.DS_Store
+.env copy.example

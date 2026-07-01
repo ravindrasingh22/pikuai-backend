@@ -4,6 +4,7 @@ from typing import Literal
 
 from app.core.security import TokenClaims, require_parent_or_admin
 from app.db.session import get_connection
+from app.modules.mail.service import send_template_email
 from app.shared.envelope import envelope
 from app.shared.exceptions import ApiError
 
@@ -20,6 +21,14 @@ def _parent_id(claims: TokenClaims) -> str:
     if claims["role"] != "parent":
         raise ApiError("FORBIDDEN", "Parent access is required.", 403)
     return claims["sub"]
+
+
+def _parent_contact(parent_id: str) -> dict[str, object] | None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT full_name, email FROM parent_users WHERE id = %s", (parent_id,))
+            parent = cursor.fetchone()
+    return dict(parent) if parent else None
 
 
 @router.get("/settings")
@@ -83,8 +92,23 @@ def create_consent(payload: ConsentPayload, claims: TokenClaims = Depends(requir
 
 
 @router.post("/delete-request")
-def delete_request() -> dict[str, object]:
+def delete_request(claims: TokenClaims = Depends(require_parent_or_admin)) -> dict[str, object]:
+    parent_id = _parent_id(claims)
+    request_id = f"PRTV-DEL-{parent_id[:8]}"
+    parent_contact = _parent_contact(parent_id)
+    if parent_contact is not None:
+        send_template_email(
+            "privacy_account_deletion_request_received_parent",
+            str(parent_contact["email"]),
+            {
+                "parent_first_name": str(parent_contact["full_name"]).split(" ", 1)[0],
+                "parent_email": parent_contact["email"],
+                "request_id": request_id,
+                "cta_link": "pratvim://parent/privacy",
+            },
+            to_name=str(parent_contact["full_name"]),
+        )
     return envelope(
-        {"request_status": "submitted", "requires_parent_pin": True},
+        {"request_status": "submitted", "requires_parent_pin": True, "request_id": request_id},
         "Delete request submitted.",
     )

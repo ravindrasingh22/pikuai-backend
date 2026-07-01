@@ -11,10 +11,12 @@ from app.modules.controls.router import router as controls_router
 from app.modules.dashboard.router import router as dashboard_router
 from app.modules.explainability.router import router as explainability_router
 from app.modules.llm.router import router as llm_router
+from app.modules.mobile_aliases.router import router as mobile_aliases_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.parent.router import router as parent_router
 from app.modules.privacy.router import router as privacy_router
 from app.modules.reports.router import router as reports_router
+from app.modules.support.router import router as support_router
 from app.modules.transcripts.router import router as transcripts_router
 from app.modules.trust.router import router as trust_router
 
@@ -25,6 +27,7 @@ api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 parent_dependencies = [Depends(require_parent_or_admin)]
 
 api_router.include_router(parent_router, prefix="/parent", tags=["parent"], dependencies=parent_dependencies)
+api_router.include_router(parent_router, prefix="/parents", tags=["parents"], dependencies=parent_dependencies)
 api_router.include_router(children_router, prefix="/children", tags=["children"], dependencies=parent_dependencies)
 api_router.include_router(controls_router, prefix="/controls", tags=["controls"], dependencies=parent_dependencies)
 api_router.include_router(privacy_router, prefix="/privacy", tags=["privacy"], dependencies=parent_dependencies)
@@ -36,5 +39,8 @@ api_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"], depe
 api_router.include_router(notifications_router, prefix="/notifications", tags=["notifications"], dependencies=parent_dependencies)
 api_router.include_router(explainability_router, prefix="/explainability", tags=["explainability"], dependencies=parent_dependencies)
 api_router.include_router(reports_router, prefix="/reports", tags=["reports"], dependencies=parent_dependencies)
+api_router.include_router(support_router, prefix="/support", tags=["support"], dependencies=parent_dependencies)
 api_router.include_router(llm_router, prefix="/llm", tags=["llm"])
 api_router.include_router(trust_router, prefix="/trust", tags=["trust"])
+api_router.include_router(mobile_aliases_router, tags=["mobile-aliases"])
+api_router.include_router(children_router, prefix="/kids", tags=["kids"], dependencies=parent_dependencies)

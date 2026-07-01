@@ -1,4 +1,5 @@
 from app.core.config import settings
+from app.modules.mail.service import DEFAULT_EMAIL_TEMPLATES
 from app.db.session import get_connection
 
 
@@ -31,6 +32,12 @@ def bootstrap_database() -> None:
             cursor.execute("ALTER TABLE parent_users ADD COLUMN IF NOT EXISTS city TEXT")
             cursor.execute("ALTER TABLE parent_users ADD COLUMN IF NOT EXISTS timezone TEXT")
             cursor.execute("ALTER TABLE parent_users ADD COLUMN IF NOT EXISTS onboarding_status TEXT DEFAULT 'complete'")
+            cursor.execute("ALTER TABLE parent_users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true")
+            cursor.execute("ALTER TABLE parent_users ADD COLUMN IF NOT EXISTS email_confirmation_code_hash TEXT")
+            cursor.execute("ALTER TABLE parent_users ADD COLUMN IF NOT EXISTS email_confirmation_expires_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE parent_users ADD COLUMN IF NOT EXISTS accepted_terms_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE parent_users ADD COLUMN IF NOT EXISTS accepted_privacy_policy_at TIMESTAMPTZ")
+            cursor.execute("ALTER TABLE parent_users ADD COLUMN IF NOT EXISTS password_set_at TIMESTAMPTZ")
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS admin_users (
@@ -42,6 +49,18 @@ def bootstrap_database() -> None:
                   status TEXT NOT NULL DEFAULT 'active',
                   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS admin_password_reset_tokens (
+                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                  admin_user_id UUID NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,
+                  token_hash TEXT NOT NULL UNIQUE,
+                  expires_at TIMESTAMPTZ NOT NULL,
+                  used_at TIMESTAMPTZ,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
             )
@@ -62,6 +81,86 @@ def bootstrap_database() -> None:
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smtp_runtime_config (
+                  id BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
+                  host TEXT NOT NULL,
+                  port INTEGER NOT NULL,
+                  secure BOOLEAN NOT NULL DEFAULT false,
+                  username TEXT NOT NULL DEFAULT '',
+                  password_optional TEXT NOT NULL DEFAULT '',
+                  mail_from TEXT NOT NULL,
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_templates (
+                  template_key TEXT PRIMARY KEY,
+                  template_ref TEXT NOT NULL,
+                  category TEXT NOT NULL,
+                  name TEXT NOT NULL,
+                  priority TEXT NOT NULL,
+                  audience TEXT NOT NULL,
+                  trigger_description TEXT NOT NULL,
+                  subject TEXT NOT NULL,
+                  preview_text TEXT NOT NULL DEFAULT '',
+                  cta_label TEXT NOT NULL DEFAULT '',
+                  body_text TEXT NOT NULL,
+                  enabled BOOLEAN NOT NULL DEFAULT true,
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            for template in DEFAULT_EMAIL_TEMPLATES:
+                cursor.execute(
+                    """
+                    INSERT INTO email_templates (
+                      template_key, template_ref, category, name, priority, audience,
+                      trigger_description, subject, preview_text, cta_label, body_text
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (template_key) DO NOTHING
+                    """,
+                    (
+                        template["template_key"],
+                        template["template_ref"],
+                        template["category"],
+                        template["name"],
+                        template["priority"],
+                        template["audience"],
+                        template["trigger"],
+                        template["subject"],
+                        template["preview_text"],
+                        template["cta_label"],
+                        template["body_text"],
+                    ),
+                )
+            cursor.execute(
+                """
+                INSERT INTO smtp_runtime_config (
+                  id,
+                  host,
+                  port,
+                  secure,
+                  username,
+                  password_optional,
+                  mail_from
+                )
+                VALUES (true, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (
+                    settings.smtp_host,
+                    settings.smtp_port,
+                    settings.smtp_secure,
+                    settings.smtp_user,
+                    settings.smtp_pass,
+                    settings.mail_from,
+                ),
             )
             cursor.execute(
                 """
@@ -123,6 +222,7 @@ def bootstrap_database() -> None:
                   classified_prompt_enabled BOOLEAN NOT NULL DEFAULT true,
                   classified_prompt_url TEXT NOT NULL,
                   chat_url TEXT NOT NULL,
+                  api_key_optional TEXT,
                   default_system_prompt TEXT NOT NULL,
                   validator_enabled BOOLEAN NOT NULL DEFAULT true,
                   validator_url TEXT NOT NULL,
@@ -139,6 +239,7 @@ def bootstrap_database() -> None:
             cursor.execute("ALTER TABLE guardrails_runtime_config ADD COLUMN IF NOT EXISTS context_to_classified_prompt_enabled BOOLEAN NOT NULL DEFAULT true")
             cursor.execute("ALTER TABLE guardrails_runtime_config ADD COLUMN IF NOT EXISTS context_to_chat_enabled BOOLEAN NOT NULL DEFAULT false")
             cursor.execute("ALTER TABLE guardrails_runtime_config ADD COLUMN IF NOT EXISTS context_to_validator_enabled BOOLEAN NOT NULL DEFAULT false")
+            cursor.execute("ALTER TABLE guardrails_runtime_config ADD COLUMN IF NOT EXISTS api_key_optional TEXT")
             cursor.execute(
                 """
                 INSERT INTO guardrails_runtime_config (

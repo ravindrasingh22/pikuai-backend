@@ -9,6 +9,7 @@ from app.modules.guardrails.client import (
     insert_token_usage,
     orchestrate_guardrails_response,
 )
+from app.modules.mail.service import send_template_email
 from app.modules.chat.child_response_service import (
     ChildResponseContext,
     generate_child_response,
@@ -352,6 +353,29 @@ def create_message(payload: ChatMessageRequest, claims: TokenClaims = Depends(re
             thread_id=thread_id,
             usages=guardrails_result.token_usage,
         )
+
+    if is_unsafe:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT full_name, email FROM parent_users WHERE id = %s", (parent_id,))
+                parent = cursor.fetchone()
+        if parent is not None:
+            template_key = (
+                "safety_urgent_concern_parent"
+                if moderation["policy_bucket"] in {"escalate", "block_and_redirect"}
+                else "safety_alert_needs_review_parent"
+            )
+            send_template_email(
+                template_key,
+                parent["email"],
+                {
+                    "parent_first_name": str(parent["full_name"]).split(" ", 1)[0],
+                    "parent_email": parent["email"],
+                    "child_profile_name": child["display_name"],
+                    "cta_link": "pratvim://parent/alerts",
+                },
+                to_name=parent["full_name"],
+            )
 
     return envelope(
         {

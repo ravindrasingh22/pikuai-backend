@@ -5,6 +5,7 @@ from typing import Literal
 
 from app.core.security import TokenClaims, require_parent_or_admin
 from app.db.session import get_connection
+from app.modules.mail.service import send_template_email
 from app.shared.envelope import envelope
 from app.shared.exceptions import ApiError
 
@@ -84,6 +85,17 @@ def _plan_child_limit(plan_code: str) -> int:
     return int(row["allowed_child_count"]) if row else 1
 
 
+def _parent_contact(parent_id: str) -> dict[str, object] | None:
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT full_name, email FROM parent_users WHERE id = %s",
+                (parent_id,),
+            )
+            parent = cursor.fetchone()
+    return dict(parent) if parent else None
+
+
 def _daily_limit_seconds(child: object) -> int:
     daily_minutes = int(child["daily_time_limit_minutes"] or 30)
     return max(0, daily_minutes * 60)
@@ -140,6 +152,19 @@ def create_child(payload: ChildPayload, claims: TokenClaims = Depends(require_pa
             )
             current_count = int(cursor.fetchone()["child_count"])
             if current_count >= limit:
+                parent_contact = _parent_contact(parent_id)
+                if parent_contact is not None:
+                    send_template_email(
+                        "profile_child_limit_reached_parent",
+                        str(parent_contact["email"]),
+                        {
+                            "parent_first_name": str(parent_contact["full_name"]).split(" ", 1)[0],
+                            "parent_email": parent_contact["email"],
+                            "child_limit": limit,
+                            "cta_link": "pratvim://parent/billing",
+                        },
+                        to_name=str(parent_contact["full_name"]),
+                    )
                 raise ApiError("ENTITLEMENT_EXCEEDED", "Current plan child profile limit reached.", 403)
 
             cursor.execute(
@@ -172,6 +197,22 @@ def create_child(payload: ChildPayload, claims: TokenClaims = Depends(require_pa
             )
             child = cursor.fetchone()
         connection.commit()
+
+    parent_contact = _parent_contact(parent_id)
+    if parent_contact is not None:
+        send_template_email(
+            "profile_child_created_parent",
+            str(parent_contact["email"]),
+            {
+                "parent_first_name": str(parent_contact["full_name"]).split(" ", 1)[0],
+                "parent_email": parent_contact["email"],
+                "child_profile_name": child["display_name"],
+                "age_band": child["age_band"],
+                "profile_link": f"pratvim://parent/children/{child['id']}",
+                "cta_link": f"pratvim://parent/children/{child['id']}",
+            },
+            to_name=str(parent_contact["full_name"]),
+        )
 
     return envelope(dict(child), "Child profile created.")
 
@@ -337,6 +378,21 @@ def patch_child(child_id: str, payload: ChildPatch, claims: TokenClaims = Depend
             updated = cursor.fetchone()
         connection.commit()
 
+    parent_contact = _parent_contact(parent_id)
+    if parent_contact is not None:
+        send_template_email(
+            "profile_child_updated_parent",
+            str(parent_contact["email"]),
+            {
+                "parent_first_name": str(parent_contact["full_name"]).split(" ", 1)[0],
+                "parent_email": parent_contact["email"],
+                "child_profile_name": updated["display_name"],
+                "profile_link": f"pratvim://parent/children/{updated['id']}",
+                "cta_link": f"pratvim://parent/children/{updated['id']}",
+            },
+            to_name=str(parent_contact["full_name"]),
+        )
+
     return envelope(dict(updated), "Child profile updated.")
 
 
@@ -365,6 +421,19 @@ def archive_child(child_id: str, claims: TokenClaims = Depends(require_parent_or
 
     if child is None:
         raise ApiError("NOT_FOUND", "Child profile was not found.", 404)
+    parent_contact = _parent_contact(parent_id)
+    if parent_contact is not None:
+        send_template_email(
+            "profile_child_deleted_parent",
+            str(parent_contact["email"]),
+            {
+                "parent_first_name": str(parent_contact["full_name"]).split(" ", 1)[0],
+                "parent_email": parent_contact["email"],
+                "child_profile_name": child["display_name"],
+                "cta_link": "pratvim://parent/children",
+            },
+            to_name=str(parent_contact["full_name"]),
+        )
     return envelope(dict(child), "Child profile archived.")
 
 
@@ -406,6 +475,19 @@ def delete_child(
 
     if child is None:
         raise ApiError("NOT_FOUND", "Child profile was not found.", 404)
+    parent_contact = _parent_contact(parent_id)
+    if parent_contact is not None:
+        send_template_email(
+            "profile_child_deleted_parent",
+            str(parent_contact["email"]),
+            {
+                "parent_first_name": str(parent_contact["full_name"]).split(" ", 1)[0],
+                "parent_email": parent_contact["email"],
+                "child_profile_name": child["display_name"],
+                "cta_link": "pratvim://parent/children",
+            },
+            to_name=str(parent_contact["full_name"]),
+        )
     return envelope(
         {"child": dict(child), "chats_deleted": delete_chats},
         "Child profile deleted." if delete_chats else "Child profile removed.",
