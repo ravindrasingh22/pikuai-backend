@@ -1,213 +1,451 @@
-# Pratvim Subscriptions & Billing Implementation Plan
+# Pratvim Subscriptions and Billing Implementation Plan
 
-**File:** `subscriptions-and-billing-implementation-plan.md`  
 **Product:** Pratvim Mobile App  
 **Primary users:** Parents and kids  
-**Admin module:** `Admin Panel → Billing`  
-**Frontend status:** Mobile frontend design is already implemented. This plan focuses on backend, admin configuration, API contracts, state wiring, and mobile integration.
+**Backend:** `pratvim-backend`  
+**Mobile app:** `pratvim-mobile-app`  
+**Admin module:** `pratvim-admin -> Billing`  
+**Last updated:** 2026-07-01
+
+This document reflects the current backend, admin, and mobile app flows. It also defines the next implementation steps needed to move billing from demo/local behavior to a backend-owned subscription flow.
 
 ---
 
-## 1. Objective
+## 1. Current Implementation Snapshot
 
-Pratvim needs a billing system where parents can use a default free monthly plan, upgrade to paid subscriptions, and buy add-on credits when eligible.
+### 1.1 Backend state
 
-The system must support:
+The backend already has a subscription foundation:
 
-1. A default **Free Active** entitlement for every parent account without an active paid subscription.
-2. Admin-configurable monthly free credits.
-3. Admin-configurable number of kids allowed per plan.
-4. Admin-configurable paid plans and add-on credit packs.
-5. Credit deduction for text input, text output, cached input, and voice usage if voice is enabled.
-6. A read-only message mode when a plan usage limit is reached.
-7. Backend-owned plan content so the mobile app can render plan cards without hardcoded plan text.
-8. Safety checks and safety responses that are never disabled by billing.
-9. All billing setup, monitoring, reporting, and adjustments under **Admin Panel → Billing**.
+- `billing_plans` table exists.
+- `subscriptions` table exists.
+- Parent registration creates a starter subscription row.
+- Billing API exposes plans, current subscription, checkout-session demo, subscription update, and cancellation.
+- Admin API can list billing plans and assign a plan to a parent.
+- Dashboard API exposes plan and child-limit information.
+- Child profile creation enforces the current plan's child limit.
+
+The backend does not yet have:
+
+- Real payment provider integration.
+- Store product mapping.
+- Webhook handling.
+- Credit wallets.
+- Credit packs.
+- Usage event billing.
+- Read-only mode after credit exhaustion.
+- Plan-copy fields for full mobile card rendering.
+- Mobile payment confirmation tied to a provider transaction.
+
+### 1.2 Mobile app state
+
+The mobile app currently has a payment UI, but it is still local/prototype behavior:
+
+- `PaymentPlansScreen` renders hardcoded plans: `monthly`, `quarterly`, `annual`.
+- `PaymentPlansScreen` updates local app state with `subscription/select`.
+- `PaymentConfirmationScreen` explicitly says no backend or gateway was called.
+- Mobile subscription state uses `planId: monthly | quarterly | annual`, which does not match backend plan codes.
+- Mobile does not call `/billing/plans`, `/billing/subscription`, or checkout aliases yet.
+
+### 1.3 Admin state
+
+The admin app currently supports limited billing operations:
+
+- Admin can fetch active billing plans from `/admin/billing/plans`.
+- Admin user detail view can change a parent plan with `/admin/users/{parent_user_id}/subscription`.
+- Admin billing view shows a selected subscription summary.
+
+Admin does not yet support:
+
+- Creating or editing billing plans from the UI.
+- Managing free plan settings.
+- Managing credit packs.
+- Viewing family wallets.
+- Viewing usage events or credit ledger.
+- Payment provider sync.
+- Invoice browsing.
 
 ---
 
-## 2. Key Product Rules
+## 2. Current Data Model
 
-### 2.1 Free Active is the default
+### 2.1 `billing_plans`
 
-Every family account must have a billing entitlement.
+Current schema:
 
-If the parent does not have an active paid subscription, the backend must assign the account to the default free plan.
-
-This includes:
-
-- Newly created parent accounts.
-- Parents who never subscribed.
-- Parents whose paid subscription was cancelled.
-- Parents whose paid subscription expired.
-- Parents whose paid subscription was not renewed.
-
-The default account mode for these users remains:
-
-```ts
-'FREE_ACTIVE'
+```sql
+CREATE TABLE IF NOT EXISTS billing_plans (
+  code TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  monthly_price_inr INTEGER NOT NULL DEFAULT 0,
+  allowed_child_count INTEGER NOT NULL CHECK (allowed_child_count >= 1),
+  features_json JSONB NOT NULL DEFAULT '[]',
+  active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
-Do **not** change the account mode to `FREE_EXHAUSTED_READ_ONLY` when free credits are used. Instead, store and return a limit flag.
+Seeded plan codes:
 
----
+| Plan code | Title | Monthly price INR | Child limit |
+|---|---|---:|---:|
+| `starter` | Starter - 1 child plan | 299 | 1 |
+| `family_plus` | Family Plus - 2 child plan | 599 | 2 |
+| `family_max` | Family Max - 4 child plan | 999 | 4 |
 
-### 2.2 Do not use exhausted account modes
+Important mismatch:
 
-Credit exhaustion should not be represented by changing the account mode.
+- The old product plan language used `Free`, `Basic`, `Plus`, and `Family`.
+- The current backend uses `starter`, `family_plus`, and `family_max`.
+- The mobile app uses `monthly`, `quarterly`, and `annual`.
 
-Use these fields instead:
-
-```ts
-usage_limit_reached: boolean
-kid_limit_reached: boolean
-message_write_mode: 'READ_WRITE' | 'READ_ONLY'
-can_chat: boolean
-can_read_history: boolean
-```
-
-Correct model:
+Decision:
 
 ```text
-Account mode = commercial entitlement state
-Limit flags = whether the current plan limit is reached
-Message write mode = whether kids can send normal new messages
+Backend plan codes must be the source of truth.
+Mobile must stop using monthly/quarterly/annual as plan IDs.
+Billing cycle can still be monthly/quarterly/annual, but it is separate from plan_code.
 ```
 
-Example:
+### 2.2 `subscriptions`
+
+Current schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  parent_user_id UUID NOT NULL REFERENCES parent_users(id) ON DELETE CASCADE,
+  plan_code TEXT NOT NULL,
+  billing_cycle TEXT NOT NULL,
+  status TEXT NOT NULL,
+  starts_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ends_at TIMESTAMPTZ,
+  auto_renew BOOLEAN NOT NULL DEFAULT true,
+  payment_provider TEXT,
+  provider_customer_id TEXT,
+  provider_subscription_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Current behavior:
+
+- Parent registration inserts `starter`, `trial`, `active`, `auto_renew=false`, `payment_provider='trial'`.
+- Demo checkout inserts a new active subscription with `payment_provider='demo'`.
+- Admin plan change inserts a new active subscription with `payment_provider='admin'`.
+- Cancellation updates the latest subscription row to `status='canceled'` and `auto_renew=false`.
+- Dashboard and child-limit code use the latest active subscription, falling back to `starter`.
+
+---
+
+## 3. Current Backend API Contracts
+
+All backend routes are under `/api/v1`.
+
+### 3.1 Parent billing routes
+
+| Route | Method | Current behavior |
+|---|---|---|
+| `/billing/plans` | GET | Returns active `billing_plans` ordered by child limit |
+| `/billing/subscription` | GET | Returns latest subscription, or fallback starter shape if none exists |
+| `/billing/checkout-session` | POST | Demo only: inserts active subscription and returns demo redirect URL |
+| `/billing/subscription` | PATCH | Inserts active subscription row and sends billing active email |
+| `/billing/subscription/cancel` | POST | Cancels latest subscription row and sends cancellation email |
+
+Current checkout payload:
+
+```ts
+type CheckoutPayload = {
+  plan_code: string;       // default "family_plus"
+  billing_cycle: string;   // default "monthly"
+};
+```
+
+### 3.2 Mobile alias routes
+
+The backend also exposes mobile-friendly aliases:
+
+| Route | Method | Maps to |
+|---|---|---|
+| `/plans/family` | GET | `/billing/plans` |
+| `/subscriptions/current` | GET | `/billing/subscription` |
+| `/checkout/session` | POST | `/billing/checkout-session` |
+| `/checkout/confirm` | POST | Demo confirmation wrapper around current subscription |
+
+Mobile should use these aliases if the rest of the mobile API convention prefers them. Otherwise, it can call the `/billing/*` routes directly.
+
+### 3.3 Admin billing routes
+
+| Route | Method | Current behavior |
+|---|---|---|
+| `/admin/billing/plans` | GET | Returns active billing plans |
+| `/admin/users/{parent_user_id}/subscription` | POST | Inserts admin-managed active subscription for parent |
+
+### 3.4 Dashboard and entitlement routes
+
+`/dashboard/overview` currently returns:
 
 ```json
 {
-  "account_mode": "FREE_ACTIVE",
-  "usage_limit_reached": true,
-  "message_write_mode": "READ_ONLY",
-  "can_chat": false,
-  "can_read_history": true
+  "child_count": 1,
+  "current_plan": "starter",
+  "current_plan_title": "Starter - 1 child plan",
+  "allowed_child_count": 1,
+  "can_add_child": false,
+  "weekly_sessions": 0,
+  "pending_alerts": 0,
+  "top_topics": [],
+  "recent_activity": []
 }
 ```
 
----
-
-### 2.3 Safety is never compromised
-
-Billing must never disable safety.
-
-This means:
-
-1. Safety classifier / guardrail checks must run even if credits are zero.
-2. High-risk safety responses must be allowed even if the plan limit is reached.
-3. Parent safety alerts must still work if billing limit is reached.
-4. Read-only mode blocks normal chat generation, not safety handling.
-
-Examples of safety-critical categories:
-
-- self-harm
-- grooming
-- blackmail
-- coercion
-- abuse
-- bullying escalation
-- unsafe meeting request
-- immediate danger
-- dangerous instruction seeking
-
-Backend rule:
+Child profile creation enforces child limit:
 
 ```text
-If usage limit is reached:
-    Run safety classifier first.
-    If safety-critical:
-        Return safe response and trigger parent safety workflow if required.
-    Else:
-        Block normal generation and keep message history read-only.
+POST /children
+if active child count >= billing_plans.allowed_child_count:
+  return 403 ENTITLEMENT_EXCEEDED
 ```
 
----
-
-### 2.4 No model variation
-
-Pratvim should not have model-based plan behavior in this version.
-
-Rules:
-
-- All plans use the same AI model / AI engine.
-- No Basic / Standard / Premium model tiers.
-- No model-based entitlements.
-- No model catalog required in Billing.
-- No model-based rate cards.
-- No model-based reports for MVP.
-
-Credit cost should be based only on usage type:
-
-- input tokens
-- output tokens
-- cached input tokens
-- voice input seconds, if enabled
-- voice output seconds, if enabled
-- STT / TTS units if used separately
+Current error is generic. It should be expanded for mobile UX.
 
 ---
 
-### 2.5 Plan content comes from backend
+## 4. Current Mobile Flow and Required Changes
 
-The mobile app should not hardcode plan card text.
+### 4.1 Current mobile payment flow
 
-Plan content should be managed from backend/admin and returned through APIs.
+Current screen flow:
 
-Backend should return:
+```text
+Parent dashboard or billing CTA
+  -> PaymentPlansScreen
+  -> local plan selection: monthly / quarterly / annual
+  -> local modal "Secure checkout"
+  -> dispatch(subscription/select)
+  -> PaymentConfirmationScreen
+```
 
-- plan name
-- title
-- subtitle
-- description
-- feature bullets
-- badge text
-- CTA text
-- footer note
-- price display text
-- credit display text
-- kids allowed display text
+Current limitations:
 
-This lets admin update plan copy without mobile app release.
+- No backend plan fetch.
+- No current subscription fetch.
+- No checkout-session request.
+- No confirm request.
+- Local `subscription` state does not match backend subscriptions.
+- Confirmation screen text says the app is offline-only.
 
----
+### 4.2 Target mobile payment flow
 
-## 3. Billing State Model
+Mobile should become backend-owned:
 
-### 3.1 Account mode
+```text
+PaymentPlansScreen loads plans from backend
+  GET /plans/family or /billing/plans
 
-Use account mode only for broad billing entitlement state.
+PaymentPlansScreen loads current subscription
+  GET /subscriptions/current or /billing/subscription
+
+Parent selects a backend plan_code and billing_cycle
+  POST /checkout/session
+
+If demo checkout:
+  show confirmation from backend response
+  POST /checkout/confirm
+
+If real provider checkout:
+  open provider checkout or native in-app purchase flow
+  confirm with backend after provider success
+
+After confirmation:
+  refresh current subscription
+  refresh dashboard overview
+  navigate to PaymentConfirmationScreen
+```
+
+### 4.3 Mobile state model changes
+
+Replace local-only state:
 
 ```ts
-type AccountMode =
-  | 'FREE_ACTIVE'
-  | 'SUBSCRIPTION_ACTIVE'
-  | 'BILLING_GRACE'
-  | 'BILLING_BLOCKED';
+type Subscription = {
+  planId: 'monthly' | 'quarterly' | 'annual';
+  status: 'Active' | 'Trial' | 'Expired';
+  validUntil: string;
+  tokensLeft: number;
+  daysLeft: number;
+};
 ```
 
-| Account mode | Meaning |
-|---|---|
-| `FREE_ACTIVE` | Default state when there is no active paid subscription |
-| `SUBSCRIPTION_ACTIVE` | Paid subscription is active |
-| `BILLING_GRACE` | Paid subscription has a billing issue but grace access is allowed |
-| `BILLING_BLOCKED` | Account blocked by billing/admin/fraud process, not normal credit exhaustion |
+With backend-aligned state:
 
-Do not create these old states:
+```ts
+type BillingPlan = {
+  code: string;
+  name?: string;
+  title: string;
+  monthly_price_inr: number;
+  allowed_child_count: number;
+  features: string[];
+  active: boolean;
+};
+
+type CurrentSubscription = {
+  parent_user_id: string;
+  plan_code: string;
+  billing_cycle: string;
+  status: string;
+  auto_renew: boolean;
+  starts_at?: string;
+  ends_at?: string;
+  updated_at?: string;
+};
+```
+
+Recommended mobile app state:
+
+```ts
+type BillingState = {
+  plans: BillingPlan[];
+  currentSubscription?: CurrentSubscription;
+  selectedPlanCode?: string;
+  selectedBillingCycle: 'monthly' | 'quarterly' | 'annual';
+  loading: boolean;
+  error?: string;
+};
+```
+
+### 4.4 Payment screen copy changes
+
+Remove this text after backend integration:
 
 ```text
-FREE_EXHAUSTED_READ_ONLY
-SUBSCRIPTION_EXHAUSTED
-NO_CREDITS_READ_ONLY
+Secure prototype checkout. No backend payment gateway is connected.
+Payment method: UPI / Card placeholder. This is UI only.
+The app remains offline-only in this prototype. No backend or gateway was called.
 ```
 
-Those should be represented by `usage_limit_reached` and `message_write_mode`.
+Replace with state-aware copy:
+
+```text
+Plan changes are managed securely by Pratvim billing.
+Your child profile limit updates after confirmation.
+```
+
+For demo checkout only:
+
+```text
+Demo checkout is enabled in this environment. No live payment will be charged.
+```
 
 ---
 
-### 3.2 Plan limit flags
+## 5. Admin Flow
 
-Use explicit limit flags.
+### 5.1 Current admin flow
+
+Admin user detail page:
+
+```text
+Admin -> Users -> Parent -> Billing panel
+  select plan from active billing plans
+  submit Update plan
+  POST /admin/users/{parent_id}/subscription
+  backend inserts active subscription with payment_provider='admin'
+  backend sends billing_family_plan_active_parent email
+```
+
+Admin Billing page:
+
+```text
+Admin -> Billing
+  displays one subscription summary from loaded parent users
+```
+
+### 5.2 Required admin improvements
+
+Admin Billing should support:
+
+1. Plan management:
+   - Create plan.
+   - Edit title.
+   - Edit price.
+   - Edit allowed child count.
+   - Edit feature bullets.
+   - Activate/deactivate plan.
+
+2. Subscription management:
+   - Search parent subscriptions.
+   - View latest subscription per parent.
+   - View subscription history.
+   - Change plan through controlled support action.
+   - Cancel or resume subscription.
+
+3. Provider state:
+   - Show payment provider.
+   - Show provider customer ID.
+   - Show provider subscription ID.
+   - Show webhook status when provider integration exists.
+
+Not implemented yet:
+
+- Free credit settings.
+- Credit packs.
+- Rate cards.
+- Usage ledger.
+- Invoices.
+- Wallet adjustments.
+
+---
+
+## 6. Entitlements and Limits
+
+### 6.1 Currently implemented
+
+Only child profile limit is implemented.
+
+Current entitlement source:
+
+```text
+effective plan = latest active subscription, else starter
+child limit = billing_plans.allowed_child_count
+```
+
+Current enforcement points:
+
+- `/dashboard/overview` returns `can_add_child`.
+- `POST /children` blocks creating a child if active child count is at or above plan limit.
+
+### 6.2 Required response shape for child limit errors
+
+Current mobile needs a better error payload for plan upgrade CTAs.
+
+Recommended error payload:
+
+```json
+{
+  "error_code": "ENTITLEMENT_EXCEEDED",
+  "message": "Current plan child profile limit reached.",
+  "details": {
+    "limit_type": "kid_count",
+    "current_plan": "starter",
+    "active_kids_count": 1,
+    "max_kids_allowed": 1,
+    "can_add_child": false,
+    "upgrade_cta": "Upgrade to add another child profile."
+  }
+}
+```
+
+### 6.3 Not implemented yet: credit usage limits
+
+The previous plan described monthly credits, add-on credits, credit deduction, and read-only mode after exhaustion. Those are not implemented in the current backend or mobile app.
+
+Do not represent this as current behavior.
+
+Future entitlement fields:
 
 ```ts
 type PlanLimitState = {
@@ -222,1527 +460,667 @@ type PlanLimitState = {
 };
 ```
 
-| Flag | Meaning |
-|---|---|
-| `usage_limit_reached` | Current plan credits are finished and no usable add-on credits are available |
-| `kid_limit_reached` | Parent has reached the max kid profiles allowed by current plan |
-| `message_write_mode` | `READ_WRITE` for normal use, `READ_ONLY` when normal chat is blocked |
-| `can_chat` | Whether normal new child messages are allowed |
-| `can_read_history` | Whether old messages can be read |
-| `can_add_child` | Whether parent can add another kid profile |
-
----
-
-## 4. Free Monthly Plan
-
-### 4.1 Free plan behavior
-
-The free plan is active by default for every account without an active paid subscription.
-
-Example:
+Future rule:
 
 ```text
-Free Plan = 10 credits/month
+Billing can block normal chat generation, but it must never disable safety guardrails, safety-critical responses, alerts, or history reads.
 ```
-
-The value must be admin configurable.
-
-The free plan should support:
-
-| Feature | Behavior |
-|---|---|
-| Monthly credits | Admin configurable |
-| Kids allowed | Admin configurable |
-| Voice enabled | Admin configurable, recommended No for MVP |
-| Add-on credits | Recommended No until paid subscription is active |
-| Message history | Always readable |
-| New chat after usage limit reached | Block normal chat, keep read-only history |
-| Safety response after usage limit reached | Always allowed for safety-critical messages |
 
 ---
 
-### 4.2 Free plan after paid cancellation
+## 7. Backend Implementation Phases
 
-When a parent cancels or loses a paid subscription:
+### Phase 1 - Align mobile with current backend
 
-1. Paid subscription status becomes cancelled/expired.
-2. The account falls back to the default free plan.
-3. `account_mode` becomes `FREE_ACTIVE`.
-4. Backend applies free plan limits.
-5. If free credits are already used for the current free period, set `usage_limit_reached = true`.
-6. If the family has more kids than the free plan allows, set `kid_limit_reached = true` and block adding more kids.
+Goal: make mobile payment screens use existing backend subscriptions.
 
-Do not delete existing child profiles.
+Tasks:
 
-Recommended MVP behavior for excess kids after downgrade/cancellation:
+1. Add mobile billing API client:
+   - `getFamilyPlans()`
+   - `getCurrentSubscription()`
+   - `createCheckoutSession(planCode, billingCycle)`
+   - `confirmCheckout()`
+
+2. Replace hardcoded mobile plan cards with backend plans:
+   - `starter`
+   - `family_plus`
+   - `family_max`
+
+3. Replace `subscription.planId` local state with backend `plan_code`.
+
+4. On payment confirmation:
+   - call backend checkout session,
+   - call confirm if demo mode,
+   - refresh subscription,
+   - refresh parent dashboard entitlement state.
+
+5. Update copy to remove "UI only" and "offline-only" language.
+
+6. Handle `ENTITLEMENT_EXCEEDED` from child creation:
+   - show upgrade CTA,
+   - navigate parent to payment plans.
+
+### Phase 2 - Improve backend plan contracts
+
+Goal: make backend plan records sufficient to render mobile plan cards without hardcoded content.
+
+Add fields to `billing_plans`:
+
+```sql
+ALTER TABLE billing_plans ADD COLUMN IF NOT EXISTS subtitle TEXT;
+ALTER TABLE billing_plans ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE billing_plans ADD COLUMN IF NOT EXISTS badge_text TEXT;
+ALTER TABLE billing_plans ADD COLUMN IF NOT EXISTS cta_text TEXT;
+ALTER TABLE billing_plans ADD COLUMN IF NOT EXISTS footer_note TEXT;
+ALTER TABLE billing_plans ADD COLUMN IF NOT EXISTS price_display_text TEXT;
+ALTER TABLE billing_plans ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;
+```
+
+Then update:
+
+- `/billing/plans`
+- `/plans/family`
+- `/admin/billing/plans`
+- admin plan management UI
+
+### Phase 3 - Real checkout provider integration
+
+Goal: replace demo checkout with actual billing provider or app store products.
+
+Backend tasks:
+
+1. Add provider product mapping table.
+2. Add checkout session creation through selected provider.
+3. Add webhook endpoints.
+4. Verify provider signatures.
+5. Store provider customer/subscription IDs.
+6. Update subscription status from webhooks, not client trust.
+7. Add idempotency keys.
+
+Mobile tasks:
+
+1. Use provider redirect URL or native in-app purchase SDK.
+2. Return to confirmation screen only after backend confirms current subscription.
+3. Show pending state if provider webhook has not arrived.
+
+### Phase 4 - Credit wallet and read-only chat
+
+Goal: implement monthly credits and optional add-on credits.
+
+New backend concepts:
+
+- billing periods,
+- credit buckets,
+- usage events,
+- immutable credit ledger,
+- credit reservation/release,
+- credit packs,
+- read-only normal chat mode.
+
+Important safety rule:
 
 ```text
-If active kids count > max kids allowed:
-    Keep all kid profiles visible to parent.
-    Allow old message history to be read.
-    Allow normal chat only for the first allowed active kid profiles or require parent to choose active kid profiles.
-    Mark remaining kid profiles as read-only until parent upgrades.
+Safety classifier, safety-critical responses, and parent alerts must still run when normal chat credits are exhausted.
 ```
 
----
+Suggested tables:
 
-### 4.3 Free usage limit reached
+- `billing_credit_buckets`
+- `billing_usage_events`
+- `billing_credit_ledger`
+- `billing_credit_packs`
+- `billing_store_products`
 
-When free monthly credits reach zero:
-
-- Keep `account_mode = FREE_ACTIVE`.
-- Set `usage_limit_reached = true`.
-- Set `message_write_mode = READ_ONLY`.
-- Set `can_chat = false` for normal chat.
-- Keep `can_read_history = true`.
-- Parent should see a subscription CTA.
-- Kid should see soft read-only messaging.
-
-Kid-facing copy:
+Suggested backend enforcement:
 
 ```text
-Your free Pratvim messages for this month are finished. You can still read your old chats. Ask your parent to unlock more Pratvim time.
+On child message:
+  run guardrail classifier/safety path
+  if safety-critical:
+    return safe response even if normal credits are exhausted
+  else:
+    check wallet balance
+    if balance insufficient:
+      return read-only/limit response
+    reserve credits
+    generate answer
+    finalize debit from measured usage
 ```
 
-Parent-facing copy:
+---
+
+## 8. Mobile Integration Details
+
+### 8.1 API client to add
+
+Suggested file:
 
 ```text
-Free monthly credits are used. Subscribe to keep Pratvim active for your kid.
+pratvim-mobile-app/src/features/payments/data/billingApi.ts
 ```
 
----
-
-## 5. Paid Subscriptions
-
-### 5.1 Paid plan behavior
-
-Paid subscriptions provide:
-
-1. Monthly access.
-2. Monthly included credits.
-3. Admin-configured kids allowed.
-4. Voice access if enabled for that plan.
-5. Eligibility for add-on credit packs.
-6. Backend-owned plan content for mobile display.
-
-Paid subscriptions do **not** provide different model tiers.
-
----
-
-### 5.2 Paid plan examples
-
-These are examples only. Final values should come from **Admin → Billing → Plans**.
-
-| Plan | Included monthly credits | Kids allowed | Voice | Add-on credits |
-|---|---:|---:|---:|---:|
-| Basic | 10,000 | 1 | No | Yes |
-| Plus | 50,000 | 2 | Yes | Yes |
-| Family | 150,000 | 4 | Yes | Yes |
-
----
-
-### 5.3 Paid usage limit reached
-
-When paid monthly credits are used:
-
-1. Use add-on credits if available.
-2. If no add-on credits are available, set `usage_limit_reached = true`.
-3. Keep `account_mode = SUBSCRIPTION_ACTIVE` if the paid subscription itself is still active.
-4. Set `message_write_mode = READ_ONLY` for normal child chat.
-5. Parent can buy add-on credits or upgrade plan.
-6. Safety-critical responses remain available.
-
-Parent-facing copy:
-
-```text
-Monthly credits are used. Add extra credits or upgrade your plan to continue chatting.
-```
-
-Kid-facing copy:
-
-```text
-Pratvim needs a quick refill from your parent to continue. You can still read your old chats.
-```
-
----
-
-## 6. Kids Allowed Limit
-
-### 6.1 Admin-configurable per plan
-
-Every plan must have an admin-configurable kids limit.
-
-Fields:
-
-```text
-max_kids_allowed
-```
-
-Examples:
-
-| Plan | Max kids allowed |
-|---|---:|
-| Free | 1 |
-| Basic | 1 |
-| Plus | 2 |
-| Family | 4 |
-
----
-
-### 6.2 Add child enforcement
-
-When parent tries to add a kid profile:
-
-```text
-Backend checks current effective plan.
-Backend counts active kid profiles.
-If active kids count >= max kids allowed:
-    Do not create new kid profile.
-    Set/return kid_limit_reached = true.
-    Return KID_LIMIT_REACHED.
-Else:
-    Create kid profile.
-```
-
-API error example:
-
-```json
-{
-  "error_code": "KID_LIMIT_REACHED",
-  "account_mode": "FREE_ACTIVE",
-  "kid_limit_reached": true,
-  "active_kids_count": 1,
-  "max_kids_allowed": 1,
-  "message": "Your current plan allows 1 kid profile. Upgrade to add more."
-}
-```
-
----
-
-## 7. Add-on Credits
-
-### 7.1 Add-on credit rule
-
-Recommended MVP rule:
-
-```text
-Only paid subscribers can buy add-on credits.
-```
-
-This keeps the funnel simple:
-
-```text
-Free plan limit reached → subscribe first.
-Paid plan limit reached → buy add-on credits or upgrade.
-```
-
----
-
-### 7.2 Add-on credit behavior
-
-| Rule | Behavior |
-|---|---|
-| Purchase type | Consumable in-app product |
-| Expiry | No expiry recommended |
-| Reset monthly | No |
-| Used before monthly credits? | No |
-| Used after monthly credits? | Yes |
-| Refund support | Ledger adjustment/reversal required |
-
----
-
-### 7.3 Credit pack examples
-
-| Pack | Credits |
-|---|---:|
-| Small Pack | 10,000 |
-| Medium Pack | 50,000 |
-| Large Pack | 150,000 |
-
-Pack amount, product IDs, display copy, status, and eligible plans should be configurable under:
-
-```text
-Admin Panel → Billing → Credit Packs
-```
-
----
-
-## 8. Credit Consumption Priority
-
-Credits should be consumed in this order:
-
-1. Free monthly credits, only for accounts on the free plan.
-2. Paid monthly subscription credits, only for active paid plans.
-3. Promotional credits, if configured.
-4. Add-on purchased credits.
-5. Admin adjustment credits.
-
-Important:
-
-```text
-Do not grant free monthly credits and paid monthly credits at the same time for the same effective billing period.
-```
-
-If a paid subscription is cancelled/expired, the account returns to free plan behavior from the next entitlement evaluation.
-
----
-
-## 9. Read-only Message Mode
-
-### 9.1 Read-only behavior
-
-Read-only mode is not an account mode. It is a message write state.
+Suggested functions:
 
 ```ts
-type MessageWriteMode = 'READ_WRITE' | 'READ_ONLY';
+export function getFamilyPlans(token: string): Promise<BillingPlan[]>;
+export function getCurrentSubscription(token: string): Promise<CurrentSubscription>;
+export function createCheckoutSession(
+  payload: { plan_code: string; billing_cycle: string },
+  token: string
+): Promise<CheckoutSession>;
+export function confirmCheckout(token: string): Promise<CheckoutConfirmation>;
 ```
 
-Allowed in read-only:
+### 8.2 PaymentPlansScreen changes
 
-- View previous conversations.
-- Open old AI responses.
-- Scroll chat history.
-- Read saved content.
-- Ask parent to unlock.
-- Safety-critical detection and response.
+Required behavior:
 
-Blocked in read-only:
+1. Read `state.auth.accessToken`.
+2. Fetch plans and current subscription on mount.
+3. Display backend plan title, price, child count, and features.
+4. Default selected plan to current subscription plan.
+5. Disable current plan CTA or show "Current plan".
+6. On submit, call checkout session.
+7. In demo mode, call confirm and navigate to confirmation.
+8. In real provider mode, open provider checkout.
 
-- Send a new normal message.
-- Generate a normal new AI answer.
-- Start normal voice chat.
-- Upload normal voice input.
+### 8.3 PaymentConfirmationScreen changes
+
+Required behavior:
+
+1. Accept `planCode`, not `monthly | quarterly | annual`.
+2. Display confirmed subscription from backend state.
+3. Remove offline-only copy.
+4. Offer "Return to Parent Home".
+5. Optionally offer "Add child profile" if `can_add_child` is true.
+
+### 8.4 Parent dashboard and child creation
+
+Parent dashboard should use backend dashboard fields:
+
+- `current_plan`
+- `current_plan_title`
+- `allowed_child_count`
+- `can_add_child`
+
+When child creation returns `ENTITLEMENT_EXCEEDED`, mobile should:
+
+1. show the backend message,
+2. explain the current child limit,
+3. offer an upgrade button,
+4. navigate to `PaymentPlans`.
 
 ---
 
-### 9.2 Backend source of truth
+## 9. Admin Implementation Details
 
-Mobile can hide the composer for UX, but backend must enforce read-only mode.
+### 9.1 Plan management API to add
+
+Recommended admin routes:
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/admin/billing/plans` | POST | Create plan |
+| `/admin/billing/plans/{code}` | PATCH | Update plan |
+| `/admin/billing/plans/{code}/deactivate` | POST | Deactivate plan |
+| `/admin/billing/plans/{code}/activate` | POST | Activate plan |
+
+### 9.2 Subscription management API to add
+
+Recommended admin routes:
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/admin/billing/subscriptions` | GET | Search/list subscriptions |
+| `/admin/billing/subscriptions/{parent_user_id}` | GET | Subscription history |
+| `/admin/billing/subscriptions/{parent_user_id}/cancel` | POST | Support cancellation |
+| `/admin/billing/subscriptions/{parent_user_id}/resume` | POST | Support resume |
+
+Current support route:
 
 ```text
-Mobile state is not trusted.
-Backend entitlement + wallet state is the final authority.
+POST /admin/users/{parent_user_id}/subscription
 ```
+
+Keep it for parent detail quick action, but move broader billing operations under `/admin/billing/*`.
 
 ---
 
-## 10. Admin Panel Structure
+## 10. Acceptance Criteria
 
-All subscription and credit settings must come under:
+### 10.1 Current backend integration acceptance
+
+Mobile billing is considered integrated with the current backend when:
+
+- PaymentPlansScreen fetches plans from backend.
+- PaymentPlansScreen displays backend plan codes and copy.
+- Current subscription is fetched from backend.
+- Selecting a plan calls backend checkout session.
+- Demo checkout creates/updates subscription on backend.
+- Confirmation screen no longer says offline-only.
+- Parent dashboard reflects updated child limit after upgrade.
+- Child creation limit errors navigate to upgrade flow.
+
+### 10.2 Admin acceptance
+
+Admin billing is considered minimally useful when:
+
+- Admin can list plans.
+- Admin can assign a plan to a parent.
+- Admin can see latest subscription on parent detail.
+- Admin can see child limit and subscription status.
+- Backend sends billing update email after admin plan change.
+
+This minimum is mostly implemented today.
+
+### 10.3 Future credit-wallet acceptance
+
+Credit wallet is considered implemented only when:
+
+- Every AI chat request produces a usage event.
+- Credits are debited in an immutable ledger.
+- Current balance is returned to mobile.
+- Normal chat is blocked when credits are exhausted.
+- Old history remains readable.
+- Safety-critical responses still run.
+- Admin can view and adjust wallet state.
+
+This is not implemented today.
+
+---
+
+## 11. Immediate Next Steps
+
+Recommended implementation order:
+
+1. Add mobile billing API client.
+2. Replace hardcoded mobile plan IDs with backend `plan_code`.
+3. Wire PaymentPlansScreen to `/plans/family` and `/subscriptions/current`.
+4. Wire Review and Pay to `/checkout/session` and `/checkout/confirm`.
+5. Update PaymentConfirmationScreen copy and route params.
+6. Refresh dashboard overview after subscription changes.
+7. Improve `ENTITLEMENT_EXCEEDED` details for child limit failures.
+8. Add backend plan display fields for mobile copy.
+9. Add admin plan create/edit UI.
+10. Plan provider/webhook integration separately after demo checkout is stable.
+
+---
+
+## 12. Decisions
+
+1. Backend plan codes are canonical.
+2. Billing cycle is separate from plan code.
+3. Current paid-provider behavior is demo only.
+4. Child-limit entitlement is currently implemented and enforced.
+5. Credit usage limits, add-on credits, and read-only chat are future work.
+6. Safety and guardrails must remain independent from billing limits.
+7. Mobile should not hardcode plan copy once backend plan display fields exist.
+
+---
+
+## 13. Complete Target Architecture
+
+### 13.1 Ownership boundaries
+
+Backend owns:
+
+- plan catalog,
+- current subscription state,
+- effective entitlement,
+- child profile limits,
+- checkout session creation,
+- payment provider verification,
+- provider webhook reconciliation,
+- future credit wallets and usage enforcement,
+- audit trail for admin/support changes.
+
+Mobile owns:
+
+- presenting backend plan data,
+- selecting a plan and billing cycle,
+- launching checkout or in-app purchase UI,
+- showing confirmation/pending/failure states,
+- refreshing dashboard and subscription state after checkout,
+- routing parent to billing when a child limit is reached.
+
+Admin owns:
+
+- plan catalog operations,
+- subscription support operations,
+- provider diagnostics,
+- future credit ledger adjustments,
+- billing reports.
+
+Payment provider owns:
+
+- payment method collection,
+- subscription renewals,
+- failed payment events,
+- invoices/receipts,
+- external payment status.
+
+Important rule:
 
 ```text
-Admin Panel → Billing
+Mobile must never be trusted as proof of payment.
+Only backend-created checkout sessions and verified provider webhooks can create or renew paid entitlement.
 ```
 
-### 10.1 Billing menu structure
+### 13.2 Final runtime flow
 
 ```text
-Billing
-├── Overview
-├── Plans
-├── Free Plan
-├── Credit Packs
-├── Rate Cards
-├── Subscriptions
-├── Family Wallets
-├── Usage Events
-├── Credit Ledger
-├── Adjustments
-├── Store Products
-├── Billing Alerts
-├── Reports
-└── Settings
+Parent opens PaymentPlansScreen
+  -> mobile fetches backend plan catalog
+  -> mobile fetches current subscription
+  -> parent chooses plan_code + billing_cycle
+  -> mobile requests checkout session
+  -> backend creates provider checkout/in-app purchase intent
+  -> parent completes provider payment
+  -> provider sends webhook to backend
+  -> backend verifies webhook and updates subscription
+  -> mobile polls or confirms checkout status
+  -> mobile refreshes subscription + dashboard
 ```
 
-Removed from MVP:
+### 13.3 Effective entitlement evaluation
 
-```text
-Model Catalog
+Create one backend helper used by dashboard, child creation, chat, and billing UI:
+
+```python
+def evaluate_entitlement(parent_user_id: str) -> EffectiveEntitlement:
+    latest_active_subscription = find_latest_active_subscription(parent_user_id)
+    if latest_active_subscription:
+        plan = find_plan(latest_active_subscription.plan_code)
+        account_mode = "SUBSCRIPTION_ACTIVE"
+    else:
+        plan = find_default_plan()
+        account_mode = "FREE_ACTIVE"
+
+    child_count = count_active_children(parent_user_id)
+    wallet = find_current_wallet(parent_user_id, plan.code)
+
+    return {
+        "account_mode": account_mode,
+        "effective_plan": plan,
+        "subscription": latest_active_subscription,
+        "child_count": child_count,
+        "can_add_child": child_count < plan.allowed_child_count,
+        "kid_limit_reached": child_count >= plan.allowed_child_count,
+        "usage_limit_reached": wallet.limit_reached if wallet else False,
+        "message_write_mode": "READ_ONLY" if wallet and wallet.limit_reached else "READ_WRITE",
+        "can_chat": not wallet.limit_reached if wallet else True,
+        "can_read_history": True,
+    }
 ```
 
-Reason:
-
-```text
-No model variation is needed. All plans use the same AI engine.
-```
+In the current codebase only the child-limit portion exists. The complete implementation should consolidate that logic instead of duplicating subscription queries in dashboard, children, and billing routers.
 
 ---
 
-### 10.2 Billing → Overview
+## 14. Complete Database Plan
 
-Purpose: show operational billing summary.
+### 14.1 Upgrade `billing_plans`
 
-Metrics:
+Current table is enough for child limit, but not enough for mobile-owned display or real products.
 
-- Active subscriptions
-- Free accounts
-- Free accounts with usage limit reached
-- Paid accounts with usage limit reached
-- Add-on credits sold
-- Credits consumed today
-- Monthly recurring revenue
-- Failed renewals
-- Billing grace accounts
-- Kids limit reached count
-- Free-to-paid conversion
-
----
-
-### 10.3 Billing → Plans
-
-Admin can configure paid plans and their mobile display content.
-
-Fields:
-
-| Field | Description |
-|---|---|
-| Plan name | Basic, Plus, Family |
-| Plan type | Paid |
-| Included monthly credits | Credits granted every billing cycle |
-| Monthly price | Display/reference price |
-| Price display text | Backend-owned display string for mobile |
-| App Store product ID | iOS subscription product ID |
-| Play Store product ID | Android subscription product ID |
-| Max kids allowed | Number of kid profiles allowed |
-| Voice enabled | Yes/No |
-| Add-on credits allowed | Yes/No |
-| Plan title | Mobile card title |
-| Plan subtitle | Mobile card subtitle |
-| Plan description | Mobile card/body text |
-| Feature bullets | JSON/list of features |
-| Badge text | Example: Popular, Best Value |
-| CTA text | Example: Start Plus |
-| Footer note | Terms/helper text |
-| Status | Active/Inactive |
-| Sort order | Display ordering |
-
-Do not include:
-
-```text
-Allowed model tier
-Model key
-Model catalog reference
-```
-
----
-
-### 10.4 Billing → Free Plan
-
-Admin can configure default free monthly access.
-
-Fields:
-
-| Field | Description |
-|---|---|
-| Free monthly credits | Default 10 or admin-configured value |
-| Reset frequency | Monthly |
-| Max kids allowed | Admin configurable |
-| Voice enabled | Yes/No, recommended No for MVP |
-| Add-on credits allowed | Recommended No |
-| Read-only after usage limit | Yes |
-| Safety always enabled | Must be Yes and not disabled |
-| Require verified parent email/phone | Recommended |
-| Plan title | Mobile card/title text |
-| Plan subtitle | Mobile subtitle |
-| Plan description | Mobile description |
-| Feature bullets | JSON/list of free plan features |
-| CTA text | Example: Continue Free / Upgrade |
-| Footer note | Helper text |
-| Status | Active/Inactive |
-
-Do not include model tier or model behavior fields.
-
----
-
-### 10.5 Billing → Credit Packs
-
-Admin can configure add-on packs.
-
-Fields:
-
-| Field | Description |
-|---|---|
-| Pack name | Small/Medium/Large |
-| Credit amount | Number of credits granted |
-| Price display text | Backend-owned display string |
-| App Store product ID | iOS consumable product ID |
-| Play Store product ID | Android consumable product ID |
-| Eligible plans | Which paid plans can buy this |
-| Pack title | Mobile card title |
-| Pack description | Mobile card text |
-| Feature bullets | Optional JSON/list |
-| CTA text | Example: Add Credits |
-| Status | Active/Inactive |
-| Sort order | Display ordering |
-
----
-
-### 10.6 Billing → Rate Cards
-
-Admin configures credit conversion rules.
-
-Rate cards are global, usage-type based, and versioned.
-
-Fields:
-
-| Field | Description |
-|---|---|
-| Rate card name | Example: Default July 2026 |
-| Version | v1, v2, v3 |
-| Status | Draft/Active/Archived |
-| Effective from | Date/time |
-| Created by | Admin user |
-
-Rate card items:
-
-| Usage type | Unit | Example |
-|---|---|---:|
-| `TEXT_INPUT_TOKEN` | Per 1,000 tokens | 10 credits |
-| `TEXT_OUTPUT_TOKEN` | Per 1,000 tokens | 40 credits |
-| `CACHED_INPUT_TOKEN` | Per 1,000 tokens | 2 credits |
-| `VOICE_INPUT_SECOND` | Per second | 3 credits |
-| `VOICE_OUTPUT_SECOND` | Per second | 4 credits |
-| `STT_AUDIO_SECOND` | Per second | 2 credits |
-| `TTS_CHARACTER` | Per 1,000 chars | 5 credits |
-
-Internal safety items:
-
-| Usage type | Recommendation |
-|---|---|
-| `SAFETY_CLASSIFIER_CALL` | Do not charge parent separately |
-| `VALIDATOR_CALL` | Do not charge parent separately |
-| `NORMALIZER_CALL` | Do not charge parent separately |
-
-Do not use `model_catalog_id` in rate card items.
-
----
-
-### 10.7 Billing → Subscriptions
-
-Admin can view subscription state by family account.
-
-Columns:
-
-- Family account
-- Parent name/email
-- Current effective plan
-- Store
-- Subscription status
-- Current period start
-- Current period end
-- Auto-renew status
-- Renewal issue
-- Cancelled/expired date
-- Fallback plan, usually Free
-- Created at
-
-Actions:
-
-- View subscription details
-- View family wallet
-- View credit ledger
-- Grant adjustment credits
-- Add internal note
-
-Do not manually mark paid subscriptions active unless there is a controlled support process.
-
----
-
-### 10.8 Billing → Family Wallets
-
-Shows credit balances and current plan limit state by family.
-
-Columns:
-
-- Family account
-- Account mode
-- Effective plan
-- Usage limit reached
-- Kid limit reached
-- Message write mode
-- Monthly credits remaining
-- Add-on credits remaining
-- Promo credits remaining
-- Total credits remaining
-- Active kids count
-- Max kids allowed
-- Next reset date
-- Last usage date
-
-Actions:
-
-- View credit buckets
-- View ledger
-- Add adjustment
-- Lock wallet if abuse detected
-- Recalculate entitlement state
-
----
-
-### 10.9 Billing → Usage Events
-
-Shows AI usage events.
-
-Columns:
-
-- Date/time
-- Family
-- Kid profile
-- Conversation
-- Input tokens
-- Cached input tokens
-- Output tokens
-- Voice input seconds
-- Voice output seconds
-- Credits charged
-- Safety-critical flag
-- Request status
-
-Filters:
-
-- Date range
-- Family
-- Kid
-- Plan
-- Usage type
-- High usage only
-- Safety-critical only
-
-Do not include model filters for MVP.
-
----
-
-### 10.10 Billing → Credit Ledger
-
-Immutable ledger of all credit changes.
-
-Ledger event types:
-
-```text
-grant
-debit
-refund
-reserve
-release
-adjustment
-expiry
-reversal
-```
-
-Columns:
-
-- Date/time
-- Family
-- Event type
-- Amount delta
-- Balance after
-- Source type
-- Request ID
-- Usage event ID
-- Admin reason
-- Idempotency key
-
----
-
-### 10.11 Billing → Adjustments
-
-Manual credit adjustments.
-
-Required fields:
-
-- Family account
-- Amount
-- Add/remove
-- Reason
-- Admin note
-- Approved by, if required
-
-Allowed reasons:
-
-```text
-Support compensation
-Refund correction
-Founder promo
-Testing grant
-Billing issue
-Migration correction
-Abuse reversal
-```
-
----
-
-### 10.12 Billing → Store Products
-
-Map internal plans/packs to iOS and Android product IDs.
-
-Fields:
-
-- Internal product ID
-- Product type: subscription/consumable
-- App Store product ID
-- Play Store product ID
-- Linked plan or credit pack
-- Status
-- Last verified date
-
----
-
-### 10.13 Billing → Billing Alerts
-
-Admin can configure alert thresholds.
-
-Examples:
-
-| Alert | Default |
-|---|---:|
-| Low credit warning | 20% remaining |
-| Very low credit warning | 5% remaining |
-| Usage limit reached | Enabled |
-| Kid limit reached | Enabled |
-| Failed renewal | Enabled |
-| High usage spike | Enabled |
-| Repeated free account creation | Enabled |
-
----
-
-### 10.14 Billing → Reports
-
-Reports:
-
-- Free to paid conversion
-- Plan distribution
-- Credit consumption by plan
-- Add-on pack purchases
-- Revenue estimate
-- Usage by kid age band
-- Usage by day/week/month
-- Free plan abuse signals
-- Usage limit reached funnel
-- Kid limit reached funnel
-
-Do not include model-based reports for MVP.
-
----
-
-### 10.15 Billing → Settings
-
-Global settings:
-
-| Setting | Purpose |
-|---|---|
-| Credit display name | Credits / Pratvim Credits |
-| Default currency | INR/USD/etc. |
-| Grace period days | Billing grace behavior |
-| Safety always enabled | Must be enabled and protected |
-| Free plan enabled | Turn default free plan on/off only if business wants closed access |
-| Default free plan ID | Used when no paid subscription is active |
-| Add-on credits require paid subscription | Recommended Yes |
-| Usage reservation enabled | Recommended Yes |
-| Minimum credit charge | Optional |
-| Rounding mode | ceil/floor/nearest |
-
----
-
-## 11. Backend Database Design
-
-### 11.1 `plans`
+Target columns:
 
 ```sql
-CREATE TABLE plans (
-  id UUID PRIMARY KEY,
-  name VARCHAR(100) NOT NULL,
-  plan_type VARCHAR(20) NOT NULL, -- free / paid
-  monthly_price_minor BIGINT DEFAULT 0,
-  currency VARCHAR(10),
-  included_monthly_credits BIGINT NOT NULL,
-  max_kids_allowed INT NOT NULL DEFAULT 1,
-  voice_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-  addon_credits_allowed BOOLEAN NOT NULL DEFAULT FALSE,
-  is_default_free BOOLEAN NOT NULL DEFAULT FALSE,
-  billing_period VARCHAR(20) NOT NULL DEFAULT 'monthly',
-  price_display_text VARCHAR(100),
-  credit_display_text VARCHAR(100),
-  kids_display_text VARCHAR(100),
-  plan_title VARCHAR(150),
-  plan_subtitle VARCHAR(250),
-  plan_description TEXT,
-  feature_bullets_json JSONB,
-  badge_text VARCHAR(100),
-  cta_text VARCHAR(100),
-  footer_note TEXT,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  sort_order INT DEFAULT 0,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+ALTER TABLE billing_plans
+  ADD COLUMN IF NOT EXISTS plan_type TEXT NOT NULL DEFAULT 'paid',
+  ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'INR',
+  ADD COLUMN IF NOT EXISTS subtitle TEXT,
+  ADD COLUMN IF NOT EXISTS description TEXT,
+  ADD COLUMN IF NOT EXISTS badge_text TEXT,
+  ADD COLUMN IF NOT EXISTS cta_text TEXT,
+  ADD COLUMN IF NOT EXISTS footer_note TEXT,
+  ADD COLUMN IF NOT EXISTS price_display_text TEXT,
+  ADD COLUMN IF NOT EXISTS child_limit_display_text TEXT,
+  ADD COLUMN IF NOT EXISTS included_monthly_credits BIGINT NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS voice_enabled BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS addon_credits_allowed BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS is_default_free BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;
+```
+
+Recommended plan definitions for MVP:
+
+| Code | Type | Cycle | Price | Kids | Credits | Notes |
+|---|---|---|---:|---:|---:|---|
+| `starter` | free/trial | monthly | 0 or 299 display depending business decision | 1 | 0 until wallet phase | Current default |
+| `family_plus` | paid | monthly | 599 | 2 | 0 until wallet phase | Active paid upgrade |
+| `family_max` | paid | monthly | 999 | 4 | 0 until wallet phase | Highest child limit |
+
+Business decision needed:
+
+```text
+Is starter truly free, or is it a paid starter plan?
+```
+
+The current database seeds `starter` at `299`, while earlier product rules described a default free monthly plan. Choose one before provider integration.
+
+### 14.2 Add store product mapping
+
+Required for App Store, Play Store, Stripe, Razorpay, or another provider.
+
+```sql
+CREATE TABLE IF NOT EXISTS billing_store_products (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  internal_product_code TEXT NOT NULL,
+  product_type TEXT NOT NULL CHECK (product_type IN ('subscription', 'consumable')),
+  provider TEXT NOT NULL,
+  provider_product_id TEXT NOT NULL,
+  provider_price_id TEXT,
+  platform TEXT NOT NULL DEFAULT 'server',
+  plan_code TEXT REFERENCES billing_plans(code),
+  billing_cycle TEXT,
+  active BOOLEAN NOT NULL DEFAULT true,
+  metadata_json JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (provider, provider_product_id, provider_price_id)
 );
 ```
 
-Important:
+### 14.3 Upgrade `subscriptions`
+
+Current `subscriptions` is usable, but needs provider lifecycle fields.
+
+```sql
+ALTER TABLE subscriptions
+  ADD COLUMN IF NOT EXISTS provider_status TEXT,
+  ADD COLUMN IF NOT EXISTS current_period_start TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS canceled_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS provider_payload_json JSONB NOT NULL DEFAULT '{}';
+```
+
+Recommended statuses:
 
 ```text
-No allowed_model_tier column.
-No model_catalog reference.
+trialing
+active
+past_due
+canceled
+expired
+incomplete
+grace
+blocked
 ```
 
----
-
-### 11.2 `family_billing_state`
-
-Stores the current effective billing state and plan limit flags for a family.
+### 14.4 Add checkout sessions
 
 ```sql
-CREATE TABLE family_billing_state (
-  id UUID PRIMARY KEY,
-  family_account_id UUID NOT NULL UNIQUE,
-  effective_plan_id UUID NOT NULL REFERENCES plans(id),
-  current_subscription_id UUID NULL,
-  account_mode VARCHAR(40) NOT NULL DEFAULT 'FREE_ACTIVE',
-  usage_limit_reached BOOLEAN NOT NULL DEFAULT FALSE,
-  kid_limit_reached BOOLEAN NOT NULL DEFAULT FALSE,
-  message_write_mode VARCHAR(20) NOT NULL DEFAULT 'READ_WRITE', -- READ_WRITE / READ_ONLY
-  can_chat BOOLEAN NOT NULL DEFAULT TRUE,
-  can_read_history BOOLEAN NOT NULL DEFAULT TRUE,
-  can_add_child BOOLEAN NOT NULL DEFAULT TRUE,
-  active_kids_count INT NOT NULL DEFAULT 0,
-  max_kids_allowed INT NOT NULL DEFAULT 1,
-  next_credit_reset_at TIMESTAMP NULL,
-  last_evaluated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS billing_checkout_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  parent_user_id UUID NOT NULL REFERENCES parent_users(id) ON DELETE CASCADE,
+  plan_code TEXT NOT NULL REFERENCES billing_plans(code),
+  billing_cycle TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  provider_checkout_session_id TEXT,
+  provider_payment_intent_id TEXT,
+  status TEXT NOT NULL DEFAULT 'created',
+  redirect_url TEXT,
+  idempotency_key TEXT,
+  metadata_json JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (idempotency_key)
 );
 ```
 
-Rules:
-
-```text
-For non-paid or cancelled paid users:
-    effective_plan_id = default free plan
-    account_mode = FREE_ACTIVE
-
-For active paid users:
-    effective_plan_id = paid plan
-    account_mode = SUBSCRIPTION_ACTIVE
-
-If credits are finished:
-    usage_limit_reached = true
-    message_write_mode = READ_ONLY
-    can_chat = false
-    account_mode does not change
-```
-
----
-
-### 11.3 `subscriptions`
+### 14.5 Add provider webhook event log
 
 ```sql
-CREATE TABLE subscriptions (
-  id UUID PRIMARY KEY,
-  family_account_id UUID NOT NULL,
-  plan_id UUID NOT NULL REFERENCES plans(id),
-  store VARCHAR(30) NOT NULL, -- apple / google / revenuecat / web
-  store_customer_id VARCHAR(200),
-  store_transaction_id VARCHAR(300),
-  status VARCHAR(40) NOT NULL, -- active / cancelled / expired / grace / billing_issue
-  current_period_start TIMESTAMP,
-  current_period_end TIMESTAMP,
-  auto_renew BOOLEAN DEFAULT TRUE,
-  cancelled_at TIMESTAMP NULL,
-  expired_at TIMESTAMP NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS billing_webhook_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider TEXT NOT NULL,
+  provider_event_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  signature_verified BOOLEAN NOT NULL DEFAULT false,
+  processing_status TEXT NOT NULL DEFAULT 'received',
+  payload_json JSONB NOT NULL,
+  error_text TEXT,
+  processed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (provider, provider_event_id)
 );
 ```
 
----
+### 14.6 Future credit wallet tables
 
-### 11.4 `credit_packs`
-
-```sql
-CREATE TABLE credit_packs (
-  id UUID PRIMARY KEY,
-  name VARCHAR(100) NOT NULL,
-  credit_amount BIGINT NOT NULL,
-  price_display_text VARCHAR(100),
-  pack_title VARCHAR(150),
-  pack_description TEXT,
-  feature_bullets_json JSONB,
-  cta_text VARCHAR(100),
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  eligible_plan_type VARCHAR(30) DEFAULT 'paid',
-  sort_order INT DEFAULT 0,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-```
-
----
-
-### 11.5 `store_products`
+Only add these when usage metering is ready.
 
 ```sql
-CREATE TABLE store_products (
-  id UUID PRIMARY KEY,
-  internal_product_key VARCHAR(120) UNIQUE NOT NULL,
-  product_type VARCHAR(30) NOT NULL, -- subscription / consumable
-  platform VARCHAR(30) NOT NULL, -- ios / android / web
-  store_product_id VARCHAR(200) NOT NULL,
-  plan_id UUID NULL REFERENCES plans(id),
-  credit_pack_id UUID NULL REFERENCES credit_packs(id),
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-```
-
----
-
-### 11.6 `credit_buckets`
-
-```sql
-CREATE TABLE credit_buckets (
-  id UUID PRIMARY KEY,
-  family_account_id UUID NOT NULL,
-  source_type VARCHAR(40) NOT NULL, -- free_monthly / paid_monthly / addon_purchase / promo / admin_adjustment
-  source_id UUID NULL,
+CREATE TABLE IF NOT EXISTS billing_credit_buckets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  parent_user_id UUID NOT NULL REFERENCES parent_users(id) ON DELETE CASCADE,
+  source_type TEXT NOT NULL,
+  source_id TEXT,
   credits_granted BIGINT NOT NULL,
   credits_remaining BIGINT NOT NULL,
-  expires_at TIMESTAMP NULL,
-  priority INT NOT NULL DEFAULT 100,
-  status VARCHAR(30) NOT NULL DEFAULT 'active', -- active / expired / reversed / locked
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+  starts_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ,
+  status TEXT NOT NULL DEFAULT 'active',
+  metadata_json JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-```
 
----
+CREATE TABLE IF NOT EXISTS billing_usage_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  parent_user_id UUID NOT NULL REFERENCES parent_users(id) ON DELETE CASCADE,
+  child_profile_id UUID REFERENCES child_profiles(id) ON DELETE SET NULL,
+  chat_message_id UUID REFERENCES chat_messages(id) ON DELETE SET NULL,
+  usage_type TEXT NOT NULL,
+  units BIGINT NOT NULL,
+  credits_charged BIGINT NOT NULL DEFAULT 0,
+  safety_critical BOOLEAN NOT NULL DEFAULT false,
+  metadata_json JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-### 11.7 `credit_ledger`
-
-```sql
-CREATE TABLE credit_ledger (
-  id UUID PRIMARY KEY,
-  family_account_id UUID NOT NULL,
-  child_id UUID NULL,
-  bucket_id UUID NULL REFERENCES credit_buckets(id),
-  event_type VARCHAR(40) NOT NULL, -- grant / debit / refund / reserve / release / adjustment / expiry / reversal
+CREATE TABLE IF NOT EXISTS billing_credit_ledger (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  parent_user_id UUID NOT NULL REFERENCES parent_users(id) ON DELETE CASCADE,
+  bucket_id UUID REFERENCES billing_credit_buckets(id) ON DELETE SET NULL,
+  usage_event_id UUID REFERENCES billing_usage_events(id) ON DELETE SET NULL,
+  event_type TEXT NOT NULL,
   amount_delta BIGINT NOT NULL,
   balance_after BIGINT NOT NULL,
-  request_id VARCHAR(120),
-  usage_event_id UUID NULL,
-  idempotency_key VARCHAR(300) UNIQUE NOT NULL,
-  metadata_json JSONB,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+  reason_code TEXT,
+  admin_user_id UUID REFERENCES admin_users(id) ON DELETE SET NULL,
+  idempotency_key TEXT,
+  metadata_json JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (idempotency_key)
 );
 ```
 
 ---
 
-### 11.8 `rate_cards`
+## 15. Complete Backend API Plan
 
-```sql
-CREATE TABLE rate_cards (
-  id UUID PRIMARY KEY,
-  name VARCHAR(150) NOT NULL,
-  version INT NOT NULL,
-  status VARCHAR(30) NOT NULL, -- draft / active / archived
-  effective_from TIMESTAMP,
-  created_by UUID,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-```
+### 15.1 Public parent billing APIs
 
----
+#### `GET /api/v1/billing/plans`
 
-### 11.9 `rate_card_items`
-
-Global usage-type pricing only.
-
-```sql
-CREATE TABLE rate_card_items (
-  id UUID PRIMARY KEY,
-  rate_card_id UUID NOT NULL REFERENCES rate_cards(id),
-  usage_type VARCHAR(50) NOT NULL,
-  unit VARCHAR(50) NOT NULL,
-  credits_per_unit BIGINT NOT NULL,
-  min_charge_credits BIGINT DEFAULT 0,
-  rounding_mode VARCHAR(20) DEFAULT 'ceil',
-  created_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-```
-
-Important:
-
-```text
-No model_catalog_id.
-No model tier.
-No model-based pricing.
-```
-
----
-
-### 11.10 `usage_events`
-
-```sql
-CREATE TABLE usage_events (
-  id UUID PRIMARY KEY,
-  family_account_id UUID NOT NULL,
-  child_id UUID NULL,
-  conversation_id UUID NULL,
-  request_id VARCHAR(120) NOT NULL,
-  rate_card_id UUID NOT NULL REFERENCES rate_cards(id),
-  input_tokens BIGINT DEFAULT 0,
-  cached_input_tokens BIGINT DEFAULT 0,
-  output_tokens BIGINT DEFAULT 0,
-  voice_input_seconds NUMERIC(12, 3) DEFAULT 0,
-  voice_output_seconds NUMERIC(12, 3) DEFAULT 0,
-  stt_audio_seconds NUMERIC(12, 3) DEFAULT 0,
-  tts_characters BIGINT DEFAULT 0,
-  credits_charged BIGINT NOT NULL DEFAULT 0,
-  safety_critical BOOLEAN NOT NULL DEFAULT FALSE,
-  charge_skipped_reason VARCHAR(100) NULL,
-  status VARCHAR(30) NOT NULL, -- reserved / completed / failed / refunded / safety_no_charge
-  metadata_json JSONB,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-```
-
----
-
-## 12. Backend Services
-
-### 12.1 Billing Entitlement Service
-
-Responsibility:
-
-- Determine current effective plan.
-- Default to Free Plan if no active paid subscription exists.
-- Keep `FREE_ACTIVE` as default for cancelled/expired paid users.
-- Determine plan credit status.
-- Determine kids limit status.
-- Return `usage_limit_reached` and `kid_limit_reached`.
-- Return `message_write_mode`.
-- Return plan content for mobile.
-
-Method:
-
-```ts
-getEntitlement(familyAccountId: string): BillingEntitlement
-```
-
----
-
-### 12.2 Family Plan State Evaluator
-
-Responsibility:
-
-- Recalculate `family_billing_state`.
-- Recalculate `usage_limit_reached`.
-- Recalculate `kid_limit_reached`.
-- Recalculate `can_chat` and `can_add_child`.
-- Run after subscription change, credit grant, debit, child add/remove, and admin plan update.
-
-Pseudo-code:
-
-```ts
-async function evaluateFamilyBillingState(familyAccountId: string) {
-  const activeSubscription = await subscriptions.findActive(familyAccountId);
-  const defaultFreePlan = await plans.getDefaultFreePlan();
-
-  const effectivePlan = activeSubscription
-    ? await plans.getById(activeSubscription.planId)
-    : defaultFreePlan;
-
-  const accountMode = activeSubscription ? 'SUBSCRIPTION_ACTIVE' : 'FREE_ACTIVE';
-  const totalCredits = await wallet.getUsableCredits(familyAccountId, effectivePlan.id);
-  const activeKidsCount = await kids.countActive(familyAccountId);
-
-  const usageLimitReached = totalCredits <= 0;
-  const kidLimitReached = activeKidsCount >= effectivePlan.maxKidsAllowed;
-
-  return familyBillingState.upsert({
-    familyAccountId,
-    effectivePlanId: effectivePlan.id,
-    currentSubscriptionId: activeSubscription?.id ?? null,
-    accountMode,
-    usageLimitReached,
-    kidLimitReached,
-    messageWriteMode: usageLimitReached ? 'READ_ONLY' : 'READ_WRITE',
-    canChat: !usageLimitReached,
-    canReadHistory: true,
-    canAddChild: activeKidsCount < effectivePlan.maxKidsAllowed,
-    activeKidsCount,
-    maxKidsAllowed: effectivePlan.maxKidsAllowed,
-  });
-}
-```
-
----
-
-### 12.3 Credit Wallet Service
-
-Responsibility:
-
-- Grant credits.
-- Reserve credits.
-- Debit credits.
-- Release reserved credits.
-- Refund credits.
-- Expire credits.
-- Return balance summary.
-
-Important:
-
-Use database transactions and row locks when debiting credits.
-
-```sql
-SELECT * FROM credit_buckets
-WHERE family_account_id = :familyAccountId
-AND status = 'active'
-AND credits_remaining > 0
-ORDER BY priority ASC, created_at ASC
-FOR UPDATE;
-```
-
----
-
-### 12.4 Usage Metering Service
-
-Responsibility:
-
-- Record AI usage.
-- Apply active global rate card.
-- Calculate credits by usage type.
-- Create usage event.
-- Link usage event to ledger debit.
-
----
-
-### 12.5 Rate Card Service
-
-Responsibility:
-
-- Manage active global rate card.
-- Price usage types.
-- Support draft/active/archive workflow.
-- Never modify active rate card in place. Create a new version.
-
----
-
-### 12.6 Purchase Verification Service
-
-Responsibility:
-
-- Verify mobile purchases.
-- Handle App Store / Play Store / RevenueCat events.
-- Prevent duplicate credit grants.
-- Activate/cancel subscriptions.
-- Grant add-on credits.
-- Re-evaluate family billing state after purchase events.
-
----
-
-### 12.7 Monthly Credit Job
-
-Runs monthly or based on each account billing cycle.
-
-Logic:
-
-```ts
-for each familyAccount:
-  if hasActivePaidSubscription(familyAccount):
-    grantPaidMonthlyCredits(familyAccount)
-  else:
-    grantFreeMonthlyCredits(familyAccount)
-    setAccountMode(familyAccount, 'FREE_ACTIVE')
-
-  evaluateFamilyBillingState(familyAccount)
-```
-
-Important:
-
-```text
-Cancelled paid users get FREE_ACTIVE by default.
-Do not grant both free and paid monthly credits for the same effective period.
-```
-
----
-
-## 13. Credit Calculation
-
-### 13.1 Usage types
-
-```ts
-type UsageType =
-  | 'TEXT_INPUT_TOKEN'
-  | 'TEXT_OUTPUT_TOKEN'
-  | 'CACHED_INPUT_TOKEN'
-  | 'VOICE_INPUT_SECOND'
-  | 'VOICE_OUTPUT_SECOND'
-  | 'STT_AUDIO_SECOND'
-  | 'TTS_CHARACTER'
-  | 'SAFETY_CLASSIFIER_CALL'
-  | 'VALIDATOR_CALL'
-  | 'NORMALIZER_CALL';
-```
-
-### 13.2 Formula
-
-```text
-credits =
-  inputTokenUnits * inputRate
-+ cachedTokenUnits * cachedInputRate
-+ outputTokenUnits * outputRate
-+ voiceInputSeconds * voiceInputRate
-+ voiceOutputSeconds * voiceOutputRate
-+ sttAudioSeconds * sttRate
-+ ttsCharacterUnits * ttsRate
-```
-
-Example:
-
-```text
-Input tokens: 800
-Cached tokens: 300
-Output tokens: 500
-Input rate: 10 credits / 1000 tokens
-Cached rate: 2 credits / 1000 tokens
-Output rate: 40 credits / 1000 tokens
-
-Input charge = 8
-Cached charge = 0.6
-Output charge = 20
-Total = 28.6
-Rounded = 29 credits
-```
-
-### 13.3 Rounding
-
-Recommended:
-
-```text
-rounding_mode = ceil
-```
-
-This avoids undercharging.
-
----
-
-## 14. Backend API Contracts
-
-### 14.1 Get billing entitlement
-
-```http
-GET /v1/billing/entitlement
-```
-
-Response: free plan with credits available
-
-```json
-{
-  "account_mode": "FREE_ACTIVE",
-  "effective_plan": {
-    "id": "free",
-    "type": "free",
-    "name": "Free",
-    "title": "Try Pratvim for free",
-    "subtitle": "A small monthly allowance to get started",
-    "description": "Your kid can safely try Pratvim with free monthly credits.",
-    "feature_bullets": [
-      "10 free credits every month",
-      "1 kid profile",
-      "Read previous chats anytime"
-    ],
-    "cta_text": "Upgrade",
-    "badge_text": "Free",
-    "price_display_text": "Free",
-    "credit_display_text": "10 credits/month",
-    "kids_display_text": "1 kid"
-  },
-  "limits": {
-    "usage_limit_reached": false,
-    "kid_limit_reached": false,
-    "message_write_mode": "READ_WRITE",
-    "can_chat": true,
-    "can_read_history": true,
-    "can_add_child": false,
-    "active_kids_count": 1,
-    "max_kids_allowed": 1
-  },
-  "features": {
-    "voice_enabled": false,
-    "can_buy_subscription": true,
-    "can_buy_addon_credits": false
-  },
-  "credits": {
-    "monthly_granted": 10,
-    "monthly_remaining": 6,
-    "addon_remaining": 0,
-    "total_remaining": 6,
-    "renews_at": "2026-08-01T00:00:00Z"
-  }
-}
-```
-
-Response: free plan limit reached
-
-```json
-{
-  "account_mode": "FREE_ACTIVE",
-  "effective_plan": {
-    "id": "free",
-    "type": "free",
-    "name": "Free",
-    "title": "Free Plan",
-    "cta_text": "Subscribe to continue",
-    "price_display_text": "Free",
-    "credit_display_text": "10 credits/month",
-    "kids_display_text": "1 kid"
-  },
-  "limits": {
-    "usage_limit_reached": true,
-    "kid_limit_reached": false,
-    "message_write_mode": "READ_ONLY",
-    "can_chat": false,
-    "can_read_history": true,
-    "can_add_child": false,
-    "active_kids_count": 1,
-    "max_kids_allowed": 1
-  },
-  "features": {
-    "voice_enabled": false,
-    "can_buy_subscription": true,
-    "can_buy_addon_credits": false
-  },
-  "credits": {
-    "monthly_granted": 10,
-    "monthly_remaining": 0,
-    "addon_remaining": 0,
-    "total_remaining": 0,
-    "renews_at": "2026-08-01T00:00:00Z"
-  }
-}
-```
-
-Response: paid subscription active
-
-```json
-{
-  "account_mode": "SUBSCRIPTION_ACTIVE",
-  "effective_plan": {
-    "id": "plus",
-    "type": "paid",
-    "name": "Plus",
-    "title": "More safe AI time for your family",
-    "subtitle": "For regular Pratvim use",
-    "description": "A monthly plan with more credits and more kid profiles.",
-    "feature_bullets": [
-      "50,000 credits every month",
-      "2 kid profiles",
-      "Voice access if enabled"
-    ],
-    "cta_text": "Current Plan",
-    "badge_text": "Popular",
-    "price_display_text": "₹XXX/month",
-    "credit_display_text": "50,000 credits/month",
-    "kids_display_text": "2 kids"
-  },
-  "limits": {
-    "usage_limit_reached": false,
-    "kid_limit_reached": false,
-    "message_write_mode": "READ_WRITE",
-    "can_chat": true,
-    "can_read_history": true,
-    "can_add_child": true,
-    "active_kids_count": 1,
-    "max_kids_allowed": 2
-  },
-  "features": {
-    "voice_enabled": true,
-    "can_buy_subscription": true,
-    "can_buy_addon_credits": true
-  },
-  "plan": {
-    "id": "plus",
-    "name": "Plus",
-    "status": "active",
-    "renews_at": "2026-08-01T00:00:00Z"
-  },
-  "credits": {
-    "monthly_granted": 50000,
-    "monthly_remaining": 12000,
-    "addon_remaining": 20000,
-    "total_remaining": 32000,
-    "used_percent": 76
-  }
-}
-```
-
----
-
-### 14.2 Get billing usage summary
-
-```http
-GET /v1/billing/usage-summary
-```
+Return backend-owned plan cards.
 
 Response:
 
 ```json
 {
-  "account_mode": "SUBSCRIPTION_ACTIVE",
-  "effective_plan": {
-    "id": "plus",
-    "name": "Plus",
-    "type": "paid"
-  },
-  "limits": {
-    "usage_limit_reached": false,
-    "kid_limit_reached": false,
-    "message_write_mode": "READ_WRITE"
-  },
-  "credits": {
-    "monthly_granted": 50000,
-    "monthly_remaining": 12000,
-    "addon_remaining": 20000,
-    "total_remaining": 32000,
-    "used_percent": 76
-  },
-  "alerts": {
-    "low_credit": true,
-    "usage_limit_reached": false,
-    "kid_limit_reached": false
-  }
-}
-```
-
----
-
-### 14.3 Get available plans
-
-```http
-GET /v1/billing/plans
-```
-
-Response:
-
-```json
-{
-  "plans": [
+  "data": [
     {
-      "id": "basic",
-      "type": "paid",
-      "name": "Basic",
-      "title": "Start safe AI learning",
-      "subtitle": "For light use",
-      "description": "A simple plan for one kid profile.",
-      "feature_bullets": [
-        "10,000 credits every month",
-        "1 kid profile",
-        "Read old chats anytime"
-      ],
-      "monthly_credits": 10000,
-      "max_kids_allowed": 1,
-      "voice_enabled": false,
-      "store_product_id": "pratvim_basic_monthly",
-      "cta_text": "Choose Basic",
-      "price_display_text": "₹XXX/month",
-      "credit_display_text": "10,000 credits/month",
-      "kids_display_text": "1 kid",
-      "recommended": false
-    },
-    {
-      "id": "plus",
-      "type": "paid",
-      "name": "Plus",
-      "title": "More safe AI time",
-      "subtitle": "For regular use",
-      "description": "More credits and more kid profiles.",
-      "feature_bullets": [
-        "50,000 credits every month",
-        "2 kid profiles",
-        "Voice access if enabled"
-      ],
-      "monthly_credits": 50000,
-      "max_kids_allowed": 2,
-      "voice_enabled": true,
-      "store_product_id": "pratvim_plus_monthly",
+      "code": "family_plus",
+      "title": "Family Plus",
+      "subtitle": "For two children",
+      "description": "Protected learning with parent controls.",
+      "monthly_price_inr": 599,
+      "currency": "INR",
+      "price_display_text": "₹599 / month",
+      "allowed_child_count": 2,
+      "child_limit_display_text": "Up to 2 child profiles",
+      "features": ["alerts", "2FA", "summaries"],
+      "badge_text": "Popular",
       "cta_text": "Choose Plus",
-      "price_display_text": "₹XXX/month",
-      "credit_display_text": "50,000 credits/month",
-      "kids_display_text": "2 kids",
-      "recommended": true
+      "footer_note": "Renews monthly. Cancel anytime.",
+      "active": true
     }
   ]
 }
 ```
 
----
+#### `GET /api/v1/billing/subscription`
 
-### 14.4 Get credit packs
+Return latest subscription plus effective entitlement.
 
-```http
-GET /v1/billing/credit-packs
-```
-
-Response for paid users:
+Response:
 
 ```json
 {
-  "eligible": true,
-  "packs": [
-    {
-      "id": "small_pack",
-      "name": "Small Pack",
-      "title": "Small Credit Pack",
-      "description": "Add extra credits for this month and beyond.",
-      "credits": 10000,
-      "cta_text": "Add 10,000 credits",
-      "price_display_text": "₹XX",
-      "store_product_id": "credits_small_pack"
+  "data": {
+    "subscription": {
+      "parent_user_id": "uuid",
+      "plan_code": "family_plus",
+      "billing_cycle": "monthly",
+      "status": "active",
+      "auto_renew": true,
+      "starts_at": "2026-07-01T00:00:00Z",
+      "ends_at": "2026-08-01T00:00:00Z",
+      "payment_provider": "demo"
     },
-    {
-      "id": "medium_pack",
-      "name": "Medium Pack",
-      "title": "Medium Credit Pack",
-      "description": "Best for regular family usage.",
-      "credits": 50000,
-      "cta_text": "Add 50,000 credits",
-      "price_display_text": "₹XX",
-      "store_product_id": "credits_medium_pack"
+    "entitlement": {
+      "account_mode": "SUBSCRIPTION_ACTIVE",
+      "effective_plan_code": "family_plus",
+      "active_kids_count": 1,
+      "max_kids_allowed": 2,
+      "kid_limit_reached": false,
+      "can_add_child": true,
+      "usage_limit_reached": false,
+      "message_write_mode": "READ_WRITE",
+      "can_chat": true,
+      "can_read_history": true
     }
-  ]
+  }
 }
 ```
 
-Response for free users:
-
-```json
-{
-  "eligible": false,
-  "reason": "SUBSCRIPTION_REQUIRED",
-  "packs": []
-}
-```
-
----
-
-### 14.5 Verify purchase
-
-```http
-POST /v1/billing/purchase/verify
-```
+#### `POST /api/v1/billing/checkout-session`
 
 Request:
 
 ```json
 {
+  "plan_code": "family_plus",
+  "billing_cycle": "monthly",
+  "provider": "demo",
   "platform": "ios",
-  "product_id": "pratvim_plus_monthly",
-  "purchase_token": "store_purchase_token",
-  "transaction_id": "store_transaction_id",
-  "purchase_type": "subscription"
+  "idempotency_key": "client-generated-uuid"
 }
 ```
 
@@ -1750,1255 +1128,572 @@ Response:
 
 ```json
 {
-  "success": true,
-  "account_mode": "SUBSCRIPTION_ACTIVE",
-  "entitlement_refresh_required": true
-}
-```
-
----
-
-### 14.6 Restore purchases
-
-```http
-POST /v1/billing/restore
-```
-
-Response:
-
-```json
-{
-  "success": true,
-  "restored_subscriptions": 1,
-  "restored_credit_packs": 0,
-  "entitlement_refresh_required": true
-}
-```
-
----
-
-### 14.7 Chat API billing response
-
-```http
-POST /v1/chat
-```
-
-Success response:
-
-```json
-{
-  "message": {
-    "id": "msg_123",
-    "content": "AI response"
+  "data": {
+    "checkout_session_id": "uuid",
+    "provider": "demo",
+    "status": "created",
+    "plan_code": "family_plus",
+    "billing_cycle": "monthly",
+    "redirect_url": "https://billing.example/pratvim/demo",
+    "demo_mode": true
   },
-  "billing": {
-    "credits_charged": 29,
-    "credits_remaining": 31971,
-    "account_mode": "SUBSCRIPTION_ACTIVE",
-    "usage_limit_reached": false,
-    "message_write_mode": "READ_WRITE"
+  "message": "Checkout created."
+}
+```
+
+#### `POST /api/v1/billing/checkout-session/{id}/confirm`
+
+For demo checkout this can immediately activate. For real providers this should validate provider state.
+
+Response:
+
+```json
+{
+  "data": {
+    "confirmed": true,
+    "subscription": {},
+    "entitlement": {}
   }
 }
 ```
 
-Usage limit reached response:
+### 15.2 Admin APIs
 
-```json
-{
-  "error_code": "PLAN_USAGE_LIMIT_REACHED",
-  "account_mode": "FREE_ACTIVE",
-  "usage_limit_reached": true,
-  "message_write_mode": "READ_ONLY",
-  "can_read_history": true,
-  "parent_required": true,
-  "message": "Ask your parent to unlock more Pratvim time."
-}
+Add or complete these routes:
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/admin/billing/plans` | GET | List plans |
+| `/admin/billing/plans` | POST | Create plan |
+| `/admin/billing/plans/{code}` | PATCH | Update plan |
+| `/admin/billing/plans/{code}/activate` | POST | Activate plan |
+| `/admin/billing/plans/{code}/deactivate` | POST | Deactivate plan |
+| `/admin/billing/subscriptions` | GET | Search subscriptions |
+| `/admin/billing/subscriptions/{parent_user_id}` | GET | Subscription history |
+| `/admin/billing/subscriptions/{parent_user_id}/change-plan` | POST | Support plan override |
+| `/admin/billing/subscriptions/{parent_user_id}/cancel` | POST | Support cancellation |
+| `/admin/billing/webhooks` | GET | Webhook event log |
+| `/admin/billing/checkout-sessions` | GET | Checkout session diagnostics |
+
+Admin support actions must write an audit record. If no dedicated audit table exists, add one:
+
+```sql
+CREATE TABLE IF NOT EXISTS admin_audit_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  admin_user_id UUID REFERENCES admin_users(id) ON DELETE SET NULL,
+  action_type TEXT NOT NULL,
+  target_type TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  reason_text TEXT,
+  metadata_json JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
-Kid limit reached response:
+### 15.3 Provider webhook API
 
-```json
-{
-  "error_code": "KID_LIMIT_REACHED",
-  "account_mode": "FREE_ACTIVE",
-  "kid_limit_reached": true,
-  "active_kids_count": 1,
-  "max_kids_allowed": 1,
-  "message": "Your current plan allows 1 kid profile. Upgrade to add more."
-}
-```
-
----
-
-## 15. Mobile App Implementation Plan
-
-The mobile frontend design is already implemented. App work should focus on wiring existing screens/components to backend state.
-
-### 15.1 Recommended mobile feature structure
-
-Use existing MVVM + UDF architecture.
+Add provider-specific endpoint:
 
 ```text
-src/features/billing/
-├── data/
-│   ├── BillingApi.ts
-│   ├── BillingRepository.ts
-│   ├── PurchaseProvider.ts
-│   └── BillingMappers.ts
-├── domain/
-│   ├── BillingModels.ts
-│   ├── GetBillingEntitlementUseCase.ts
-│   ├── GetUsageSummaryUseCase.ts
-│   ├── GetPlansUseCase.ts
-│   ├── GetCreditPacksUseCase.ts
-│   ├── PurchaseSubscriptionUseCase.ts
-│   ├── PurchaseCreditPackUseCase.ts
-│   └── RestorePurchasesUseCase.ts
-├── presentation/
-│   ├── screens/
-│   │   ├── SubscriptionPlansScreen.tsx
-│   │   ├── UsageDashboardScreen.tsx
-│   │   ├── AddCreditsScreen.tsx
-│   │   ├── BillingHistoryScreen.tsx
-│   │   └── PaymentProcessingScreen.tsx
-│   ├── components/
-│   │   ├── CreditMeter.tsx
-│   │   ├── PlanCard.tsx
-│   │   ├── CreditPackCard.tsx
-│   │   ├── LowCreditBanner.tsx
-│   │   └── ReadOnlyNotice.tsx
-│   └── store/
-│       ├── BillingState.ts
-│       ├── BillingActions.ts
-│       ├── BillingReducer.ts
-│       └── BillingEffects.ts
+POST /api/v1/billing/webhooks/{provider}
 ```
 
-Map these into existing app folders if names differ.
+Webhook handling rules:
+
+1. Verify signature before processing.
+2. Store event in `billing_webhook_events`.
+3. Enforce idempotency by provider event ID.
+4. Map provider product/price ID to internal plan.
+5. Update `subscriptions`.
+6. Recompute entitlement.
+7. Send transactional email if subscription became active/canceled/past_due.
+
+Provider event mapping:
+
+| Provider event | Internal action |
+|---|---|
+| checkout completed | create or activate subscription |
+| subscription renewed | extend current period |
+| payment failed | set `past_due` or `grace` |
+| subscription canceled | set `canceled` |
+| subscription expired | set `expired`, fallback to starter/free |
+| refund | mark metadata, optionally add ledger reversal in future wallet phase |
 
 ---
 
-## 16. Mobile State Model
+## 16. Complete Mobile Implementation Plan
 
-### 16.1 `BillingState`
+### 16.1 Files to add/update
+
+Add:
+
+```text
+src/features/payments/data/billingApi.ts
+src/features/payments/presentation/viewmodels/useBillingViewModel.ts
+```
+
+Update:
+
+```text
+src/app/state/types.ts
+src/app/state/appReducer.ts
+src/features/payments/presentation/screens/PaymentPlansScreen.tsx
+src/features/payments/presentation/screens/PaymentConfirmationScreen.tsx
+src/features/parent/presentation/viewmodels/useParentViewModel.ts
+src/features/parent/presentation/screens/ParentDashboardScreen.tsx
+src/features/parent/presentation/screens/CreateChildProfileScreen.tsx
+```
+
+### 16.2 Mobile API client
 
 ```ts
-export type AccountMode =
-  | 'FREE_ACTIVE'
-  | 'SUBSCRIPTION_ACTIVE'
-  | 'BILLING_GRACE'
-  | 'BILLING_BLOCKED';
+export type BillingPlan = {
+  code: string;
+  title: string;
+  subtitle?: string;
+  description?: string;
+  monthly_price_inr: number;
+  price_display_text?: string;
+  allowed_child_count: number;
+  child_limit_display_text?: string;
+  features: string[];
+  badge_text?: string;
+  cta_text?: string;
+  footer_note?: string;
+  active: boolean;
+};
 
-export type MessageWriteMode = 'READ_WRITE' | 'READ_ONLY';
-
-export type BillingState = {
-  isLoading: boolean;
-  accountMode: AccountMode;
-  effectivePlan: {
-    id: string;
-    type: 'free' | 'paid';
-    name: string;
-    title?: string;
-    subtitle?: string;
-    description?: string;
-    featureBullets: string[];
-    badgeText?: string;
-    ctaText?: string;
-    priceDisplayText?: string;
-    creditDisplayText?: string;
-    kidsDisplayText?: string;
+export type CurrentSubscriptionResponse = {
+  subscription: {
+    parent_user_id: string;
+    plan_code: string;
+    billing_cycle: string;
+    status: string;
+    auto_renew: boolean;
+    starts_at?: string;
+    ends_at?: string;
+    payment_provider?: string;
   };
-  limits: {
-    usageLimitReached: boolean;
-    kidLimitReached: boolean;
-    messageWriteMode: MessageWriteMode;
-    canChat: boolean;
-    canReadHistory: boolean;
-    canAddChild: boolean;
-    activeKidsCount: number;
-    maxKidsAllowed: number;
+  entitlement: {
+    account_mode: string;
+    effective_plan_code: string;
+    active_kids_count: number;
+    max_kids_allowed: number;
+    kid_limit_reached: boolean;
+    can_add_child: boolean;
+    usage_limit_reached: boolean;
+    message_write_mode: 'READ_WRITE' | 'READ_ONLY';
+    can_chat: boolean;
+    can_read_history: boolean;
   };
-  features: {
-    voiceEnabled: boolean;
-    canBuySubscription: boolean;
-    canBuyAddonCredits: boolean;
-  };
-  credits: {
-    monthlyGranted: number;
-    monthlyRemaining: number;
-    addonRemaining: number;
-    totalRemaining: number;
-    usedPercent?: number;
-    renewsAt?: string;
-  };
-  alerts: {
-    lowCredit: boolean;
-    usageLimitReached: boolean;
-    kidLimitReached: boolean;
-  };
-  plans: BillingPlan[];
-  creditPacks: CreditPack[];
-  error?: string;
 };
 ```
 
-Do not include:
+### 16.3 PaymentPlansScreen required behavior
 
-```text
-allowedModelTier
-modelTier
-modelKey
-```
+States:
 
----
+- loading plans,
+- loading current subscription,
+- selecting plan,
+- creating checkout,
+- checkout failed,
+- checkout pending,
+- checkout confirmed.
 
-### 16.2 Billing actions
+Rendering rules:
 
-```ts
-export type BillingAction =
-  | { type: 'BILLING_LOAD_REQUESTED' }
-  | { type: 'BILLING_LOAD_SUCCEEDED'; payload: BillingEntitlement }
-  | { type: 'BILLING_LOAD_FAILED'; error: string }
-  | { type: 'PLANS_LOAD_SUCCEEDED'; payload: BillingPlan[] }
-  | { type: 'CREDIT_PACKS_LOAD_SUCCEEDED'; payload: CreditPack[] }
-  | { type: 'PURCHASE_STARTED'; productId: string }
-  | { type: 'PURCHASE_SUCCEEDED' }
-  | { type: 'PURCHASE_FAILED'; error: string }
-  | { type: 'RESTORE_PURCHASES_SUCCEEDED' }
-  | { type: 'CHAT_BILLING_UPDATED'; payload: ChatBillingUpdate }
-  | { type: 'PLAN_USAGE_LIMIT_REACHED'; payload: BillingLimitPayload }
-  | { type: 'KID_LIMIT_REACHED'; payload: BillingLimitPayload };
-```
+- Current plan gets "Current plan" marker.
+- Plans unavailable because they are inactive are hidden.
+- CTA text comes from backend if available.
+- Feature bullets come from backend.
+- Price display comes from backend.
+- Child limit display comes from backend or derived from `allowed_child_count`.
 
----
-
-## 17. Mobile Screen Wiring
-
-### 17.1 Parent dashboard
-
-On parent dashboard load:
-
-1. Call `GET /v1/billing/entitlement`.
-2. Call `GET /v1/billing/usage-summary`.
-3. Show usage meter from backend credits.
-4. Show free plan card/content from backend.
-5. Show paid plan CTA if `account_mode = FREE_ACTIVE`.
-6. Show add credit CTA only when `features.canBuyAddonCredits = true`.
-7. Show kid limit prompt if `limits.kidLimitReached = true`.
-
-UI state logic:
-
-| Backend state | Parent dashboard behavior |
-|---|---|
-| `FREE_ACTIVE`, `usage_limit_reached=false` | Show free meter and upgrade CTA |
-| `FREE_ACTIVE`, `usage_limit_reached=true` | Show free limit reached message and subscribe CTA |
-| `SUBSCRIPTION_ACTIVE`, `usage_limit_reached=false` | Show current plan, usage, add credits, upgrade |
-| `SUBSCRIPTION_ACTIVE`, `usage_limit_reached=true` | Show add credits / upgrade CTA |
-| `kid_limit_reached=true` | Show upgrade CTA to add more kids |
-
----
-
-### 17.2 Kid chat screen
-
-Before enabling composer:
-
-1. Load entitlement.
-2. Check `limits.canChat`.
-3. Check `limits.messageWriteMode`.
-4. If `canChat = true`, show normal composer.
-5. If `canChat = false` and `canReadHistory = true`, show read-only composer.
-
-Pseudo-code:
+Submit behavior:
 
 ```ts
-if (!billing.limits.canChat && billing.limits.canReadHistory) {
-  return <ReadOnlyComposer onAskParent={openParentGate} />;
-}
+async function reviewAndPay() {
+  const session = await createCheckoutSession({
+    plan_code: selectedPlanCode,
+    billing_cycle: selectedBillingCycle,
+    provider: 'demo',
+    platform: Platform.OS,
+    idempotency_key: uuid()
+  }, token);
 
-return <ChatComposer />;
-```
-
-Do not rely only on `accountMode`.
-
----
-
-### 17.3 On chat send
-
-After `POST /v1/chat`:
-
-1. If success, append AI response.
-2. Update billing state from `response.billing`.
-3. If `PLAN_USAGE_LIMIT_REACHED`, switch kid UI to read-only.
-4. If safety response is returned, display it even if usage limit is reached.
-
-Pseudo-code:
-
-```ts
-const response = await chatApi.sendMessage(input);
-
-if (response.error_code === 'PLAN_USAGE_LIMIT_REACHED') {
-  dispatch({
-    type: 'PLAN_USAGE_LIMIT_REACHED',
-    payload: mapLimitResponse(response),
-  });
-  showReadOnlyMode();
-  return;
-}
-
-if (response.message) {
-  appendMessage(response.message);
-}
-
-dispatch({
-  type: 'CHAT_BILLING_UPDATED',
-  payload: response.billing,
-});
-```
-
----
-
-### 17.4 Add kid flow
-
-Before allowing parent to create another kid profile:
-
-1. Call entitlement or use latest billing state.
-2. Check `limits.canAddChild`.
-3. If false, show plan upgrade message.
-4. If true, continue existing child creation flow.
-
-Pseudo-code:
-
-```ts
-if (!billing.limits.canAddChild) {
-  showKidLimitReachedModal({
-    activeKidsCount: billing.limits.activeKidsCount,
-    maxKidsAllowed: billing.limits.maxKidsAllowed,
-  });
-  return;
-}
-
-navigateToCreateKidProfile();
-```
-
-Backend must still enforce the limit.
-
----
-
-### 17.5 Subscription plans screen
-
-On screen open:
-
-1. Call `GET /v1/billing/plans`.
-2. Render existing plan cards using backend content.
-3. On select plan, call native purchase provider.
-4. On purchase success, send receipt/token to backend.
-5. Refresh entitlement.
-6. Navigate to parent dashboard or payment confirmation screen.
-
----
-
-### 17.6 Add credits screen
-
-On screen open:
-
-1. Call `GET /v1/billing/credit-packs`.
-2. If eligible, show packs using backend content.
-3. If not eligible, show subscription CTA.
-4. On pack purchase, verify purchase with backend.
-5. Refresh entitlement.
-
----
-
-### 17.7 Restore purchases screen
-
-Action:
-
-1. Trigger native restore.
-2. Send restored transaction data to backend.
-3. Call `POST /v1/billing/restore`.
-4. Refresh entitlement.
-
----
-
-## 18. Mobile Navigation Flow
-
-### 18.1 Free user first-time flow
-
-```text
-Parent onboarding
-→ Parent dashboard
-→ account_mode = FREE_ACTIVE
-→ Kid can chat while usage_limit_reached = false
-→ Credits finish
-→ account_mode remains FREE_ACTIVE
-→ usage_limit_reached = true
-→ Kid read-only message mode
-→ Parent subscription screen
-→ Purchase subscription
-→ account_mode = SUBSCRIPTION_ACTIVE
-→ usage_limit_reached = false
-→ Kid chat unlocked
-```
-
----
-
-### 18.2 Cancelled paid subscription flow
-
-```text
-Paid subscription cancelled/expired
-→ Backend falls back to default Free Plan
-→ account_mode = FREE_ACTIVE
-→ Free plan credits/limits apply
-→ Kids allowed limit applies from Free Plan config
-→ Parent sees upgrade CTA
-```
-
----
-
-### 18.3 Paid user limit reached flow
-
-```text
-Kid sends message
-→ Backend checks entitlement
-→ Paid monthly credits exhausted
-→ Add-on credits unavailable
-→ account_mode remains SUBSCRIPTION_ACTIVE
-→ usage_limit_reached = true
-→ message_write_mode = READ_ONLY
-→ Kid sees Ask Parent
-→ Parent PIN gate
-→ Add Credits / Upgrade Plan
-→ Purchase success
-→ Entitlement refresh
-→ Kid chat unlocked
-```
-
----
-
-### 18.4 Existing parent billing flow
-
-```text
-Parent Dashboard
-→ Billing / Usage
-→ View credits
-→ Manage Plan
-→ Add Credits
-→ Billing History
-→ Restore Purchases
-```
-
----
-
-## 19. Parent PIN / Gate Rule
-
-Payment screens must never be accessible directly from the kid area.
-
-When kid taps **Ask Parent**:
-
-1. Open parent gate / PIN screen.
-2. After parent verification, navigate to parent billing screen.
-3. Show subscription or add credit options depending on entitlement.
-
-Pseudo-flow:
-
-```text
-Kid Read-only Screen
-→ Ask Parent
-→ Parent PIN
-→ Billing Screen
-```
-
----
-
-## 20. Backend Chat Enforcement
-
-Backend must be the final authority.
-
-Mobile checks are only UX helpers. Backend must enforce:
-
-- subscription status
-- default free plan fallback
-- free plan credit limit
-- paid plan credit limit
-- kids allowed limit
-- add-on credit eligibility
-- voice entitlement
-- read-only message mode
-- safety exception
-
-Pseudo-code:
-
-```ts
-async function handleChatRequest(request) {
-  const entitlement = await billingEntitlementService.getEntitlement(request.familyAccountId);
-
-  // Safety always runs, even if plan limit is reached.
-  const safety = await safetyService.classify(request.message, request.context);
-
-  if (!entitlement.limits.canChat) {
-    if (safety.isSafetyCritical) {
-      return generateSafetyResponse({
-        request,
-        safety,
-        chargeCredits: false,
-        notifyParentIfRequired: true,
-      });
-    }
-
-    return planUsageLimitReachedResponse(entitlement);
+  if (session.demo_mode) {
+    const confirmation = await confirmCheckout(session.checkout_session_id, token);
+    refreshSubscription();
+    refreshDashboard();
+    navigation.navigate('PaymentConfirmation', { planCode: selectedPlanCode });
+    return;
   }
 
-  const reservation = await walletService.reserveCredits({
-    familyAccountId: request.familyAccountId,
-    estimatedCredits: request.estimatedCredits,
-    requestId: request.requestId,
-  });
-
-  try {
-    const aiResponse = await chatService.generate(request);
-    const usage = await usageMeteringService.calculate(aiResponse.usage);
-
-    await walletService.finalizeDebit({
-      reservationId: reservation.id,
-      actualCredits: usage.credits,
-      usageEventId: usage.id,
-    });
-
-    await familyPlanStateEvaluator.evaluate(request.familyAccountId);
-
-    return successResponse(aiResponse, usage);
-  } catch (error) {
-    await walletService.releaseReservation(reservation.id);
-    throw error;
-  }
+  openProviderCheckout(session.redirect_url);
 }
 ```
 
----
+### 16.4 PaymentConfirmationScreen required behavior
 
-## 21. Purchase Integration Recommendation
+Route params:
 
-### 21.1 Recommended MVP option
-
-Use a purchase abstraction layer:
-
-```text
-Mobile App → PurchaseProvider → App Store / Play Store
-Mobile App → Backend Verify Purchase
-Backend → Subscription/Credit Wallet Update
+```ts
+type PaymentConfirmationParams = {
+  planCode: string;
+  checkoutSessionId?: string;
+};
 ```
 
-If using RevenueCat:
+Screen should show:
+
+- confirmed plan title,
+- subscription status,
+- child profile limit,
+- next renewal/end date when present,
+- CTA: Return to Parent Home,
+- optional CTA: Add Child Profile when `can_add_child=true`.
+
+### 16.5 Child limit mobile behavior
+
+When `POST /children` returns `ENTITLEMENT_EXCEEDED`:
 
 ```text
-Mobile App → RevenueCat SDK
-RevenueCat → App Store / Play Store
-RevenueCat Webhook → Backend
-Backend → Entitlement + Credit Wallet
+Show bottom sheet/modal:
+  title: "Your current plan allows 1 child profile"
+  body: backend message
+  primary CTA: "View plans"
+  secondary CTA: "Not now"
 ```
 
-RevenueCat can reduce complexity for cross-platform subscriptions, restore purchases, subscription status, and webhooks.
+Then navigate:
 
----
-
-### 21.2 Backend should still keep own entitlement
-
-Even if RevenueCat is used, Pratvim backend should keep its own:
-
-- subscriptions table
-- family billing state table
-- wallet table
-- ledger table
-- usage events
-- entitlement API
-
-Reason:
-
-```text
-RevenueCat manages purchase state.
-Pratvim backend manages credits, usage, read-only mode, kids limits, and safety exceptions.
+```ts
+navigation.navigate('PaymentPlans', { reason: 'child_limit' });
 ```
 
 ---
 
-## 22. Idempotency Rules
+## 17. Complete Admin Implementation Plan
 
-All billing operations must be idempotent.
+### 17.1 Billing overview
 
-Use idempotency keys for:
+Admin Billing overview should show:
 
-- subscription activation
-- subscription renewal
-- subscription cancellation
-- free monthly credit grant
-- add-on credit grant
-- refund
-- credit adjustment
-- credit debit
-- reservation release
+- active subscriptions,
+- trial/starter accounts,
+- past_due accounts,
+- canceled accounts,
+- plan distribution,
+- estimated MRR,
+- child-limit exceeded attempts,
+- checkout sessions created,
+- checkout sessions failed,
+- webhook failures.
 
-Example:
+### 17.2 Plans tab
 
-```text
-apple:transaction_id:product_id
-android:purchase_token:product_id
-revenuecat:event_id
-free_monthly:family_id:period
-paid_monthly:subscription_id:period
-chat:request_id:usage_debit
+Admin can:
+
+- create a plan,
+- edit plan copy,
+- edit price,
+- edit child limit,
+- edit features,
+- set active/inactive,
+- reorder plans,
+- preview mobile card.
+
+Fields:
+
+- `code`,
+- `title`,
+- `subtitle`,
+- `description`,
+- `monthly_price_inr`,
+- `currency`,
+- `price_display_text`,
+- `allowed_child_count`,
+- `features_json`,
+- `badge_text`,
+- `cta_text`,
+- `footer_note`,
+- `active`,
+- `sort_order`.
+
+### 17.3 Subscriptions tab
+
+Admin can:
+
+- search parent by email/name,
+- view latest subscription,
+- view history,
+- change plan with reason,
+- cancel/resume with reason,
+- view provider IDs,
+- view related webhook events.
+
+All writes require:
+
+- admin auth,
+- reason text,
+- audit event,
+- transactional email where user-visible.
+
+### 17.4 Provider diagnostics tab
+
+Admin can inspect:
+
+- checkout sessions,
+- webhook events,
+- signature verification status,
+- processing errors,
+- raw provider event type,
+- linked subscription.
+
+---
+
+## 18. Credit Wallet Future Scope
+
+Credit wallet is not required to complete backend-owned subscription checkout, but it should be planned as a separate milestone.
+
+### 18.1 Credit deduction inputs
+
+Credit costs can be based on:
+
+- input tokens,
+- output tokens,
+- cached input tokens,
+- voice input seconds,
+- voice output seconds,
+- STT units,
+- TTS units.
+
+Guardrail internals should be tracked for operational cost, but not charged separately to parent in MVP.
+
+### 18.2 Read-only mode
+
+Read-only mode is not an account status. It is an entitlement result:
+
+```ts
+message_write_mode: 'READ_WRITE' | 'READ_ONLY'
 ```
 
-Never grant credits twice for the same purchase or monthly cycle.
+Allowed:
+
+- read old chats,
+- open saved responses,
+- safety-critical messages,
+- parent alerts.
+
+Blocked:
+
+- normal new child messages,
+- normal voice chat,
+- normal image/file upload when it would trigger generation.
+
+### 18.3 Chat integration
+
+When wallet exists, `/chat/message` must:
+
+1. run safety classification,
+2. allow safety-critical response even when credits are exhausted,
+3. check credit balance before normal generation,
+4. reserve estimated credits,
+5. run generation,
+6. debit actual credits,
+7. release unused reservation,
+8. write usage event and ledger entries.
 
 ---
 
-## 23. Notifications
+## 19. Testing Plan
 
-### 23.1 Parent notifications
+### 19.1 Backend unit tests
 
-| Trigger | Message |
-|---|---|
-| 20% credits left | Credits are running low. Add more or upgrade to avoid interruption. |
-| Usage limit reached on free plan | Free monthly credits are used. Subscribe to continue chatting. |
-| Usage limit reached on paid plan | Monthly credits are used. Add credits to continue. |
-| Kid limit reached | Your current plan has reached the kid profile limit. Upgrade to add more. |
-| Subscription renewal | Monthly credits have refreshed. |
-| Payment failed | Payment could not be completed. Update billing to keep Pratvim active. |
+Add tests for:
 
-### 23.2 Kid messages
+- plan listing,
+- current subscription fallback,
+- checkout session idempotency,
+- admin plan change,
+- cancellation,
+- child-limit entitlement,
+- dashboard entitlement fields,
+- webhook idempotency,
+- provider event mapping.
 
-Keep kid messages simple and non-commercial.
+### 19.2 Backend integration tests
 
-Use:
+Scenarios:
 
-```text
-Ask your parent to unlock more Pratvim time.
-```
+1. New parent gets starter/trial subscription.
+2. Starter parent can create one child.
+3. Starter parent cannot create second child.
+4. Admin upgrades parent to `family_plus`.
+5. Parent can now create second child.
+6. Parent checkout upgrades to `family_max`.
+7. Dashboard reflects four-child limit.
+8. Cancellation falls back to starter/free behavior.
+9. Duplicate webhook does not duplicate subscription rows.
 
-Avoid:
+### 19.3 Mobile tests
 
-```text
-Payment failed
-Buy subscription
-Your plan expired
-Billing issue
-```
+Manual and automated checks:
 
----
+- plan loading skeleton,
+- plan load error,
+- current plan marker,
+- backend checkout success,
+- backend checkout failure,
+- confirmation screen content,
+- dashboard refresh after upgrade,
+- child-limit modal and upgrade navigation.
 
-## 24. Billing History
+### 19.4 Admin tests
 
-Parent should see simple billing history.
+Check:
 
-Items:
-
-- Plan purchase
-- Plan renewal
-- Add-on credit purchase
-- Credit adjustment
-- Refund if applicable
-
-Do not show token-level usage events to parents in MVP.
-
-Admin can see detailed usage events.
-
----
-
-## 25. Implementation Phases
-
-## Phase 1: Backend Foundation
-
-### Tasks
-
-1. Add database tables:
-   - `plans`
-   - `family_billing_state`
-   - `subscriptions`
-   - `credit_packs`
-   - `store_products`
-   - `credit_buckets`
-   - `credit_ledger`
-   - `rate_cards`
-   - `rate_card_items`
-   - `usage_events`
-2. Seed default Free Plan.
-3. Seed Basic, Plus, Family plans.
-4. Implement Billing Entitlement Service.
-5. Implement Family Plan State Evaluator.
-6. Implement Credit Wallet Service.
-7. Implement Rate Card Service.
-8. Implement Usage Metering Service.
-9. Implement monthly free credit grant job.
-10. Implement monthly paid credit grant job.
-
-### Acceptance criteria
-
-- New family without subscription gets `account_mode = FREE_ACTIVE`.
-- Cancelled paid user falls back to `account_mode = FREE_ACTIVE`.
-- Free credits are consumed correctly.
-- Free credit exhaustion sets `usage_limit_reached = true` without changing `account_mode`.
-- Paid credit exhaustion sets `usage_limit_reached = true` without changing `account_mode`.
-- Kids limit is controlled by admin plan config.
-- Plan content is returned from backend.
-- Ledger records all grants and debits.
+- plans load,
+- plan update validation,
+- parent plan override,
+- audit event creation,
+- subscription status display,
+- webhook diagnostics display.
 
 ---
 
-## Phase 2: Admin Billing Panel
+## 20. Rollout Plan
 
-### Tasks
+### Step 1 - Demo backend integration
 
-Under **Admin → Billing**, implement:
+- Keep provider as `demo`.
+- Mobile calls real backend endpoints.
+- Remove local-only payment copy.
+- Confirm dashboard and child-limit behavior.
 
-1. Billing Overview
-2. Plans
-3. Free Plan
-4. Credit Packs
-5. Rate Cards
-6. Subscriptions
-7. Family Wallets
-8. Usage Events
-9. Credit Ledger
-10. Adjustments
-11. Store Products
-12. Billing Alerts
-13. Reports
-14. Billing Settings
+### Step 2 - Admin plan management
 
-### Acceptance criteria
+- Add plan create/edit UI.
+- Add audit trail.
+- Keep checkout demo mode.
 
-- Admin can configure free monthly credits.
-- Admin can configure kids allowed for Free Plan.
-- Admin can configure kids allowed for each paid plan.
-- Admin can configure paid plan content shown in mobile.
-- Admin can configure credit pack content shown in mobile.
-- Admin can configure global usage-type rates.
-- Admin can activate a new rate card version.
-- Admin can view wallet and ledger for each family.
-- Admin can manually adjust credits with reason.
-- No Model Catalog page exists in Billing for MVP.
-- No model tier/variation fields exist in plan setup.
+### Step 3 - Provider sandbox
 
----
+- Add provider mapping and checkout sessions.
+- Add sandbox webhooks.
+- Verify signature and idempotency.
+- Keep admin diagnostics visible.
 
-## Phase 3: Mobile Billing Wiring
+### Step 4 - Production provider
 
-### Tasks
+- Configure production provider keys through environment/secrets.
+- Enable webhook endpoint.
+- Run test purchases.
+- Monitor webhook failures.
 
-1. Add billing API client.
-2. Add billing repository.
-3. Add billing state/reducer/effects.
-4. Wire parent dashboard credit meter.
-5. Wire subscription screen to backend plan content.
-6. Wire add credits screen to backend credit pack content.
-7. Wire kid chat screen to `limits.canChat` and `limits.messageWriteMode`.
-8. Add read-only message behavior.
-9. Wire add-kid flow to `limits.canAddChild`.
-10. Add parent PIN gate before billing actions from kid flow.
-11. Add restore purchase flow.
+### Step 5 - Credit wallet
 
-### Acceptance criteria
-
-- Parent sees free credits remaining.
-- Parent sees paid plan usage.
-- Parent sees plan copy from backend.
-- Kid can chat when `limits.canChat = true`.
-- Kid cannot send normal messages when `limits.canChat = false`.
-- Kid can still read old messages in read-only mode.
-- Parent can navigate to subscription screen when free usage limit is reached.
-- Paid parent can navigate to add credits when usage limit is reached.
-- Parent cannot add more kids when `limits.canAddChild = false`.
+- Add wallet tables and usage events.
+- Start in shadow mode: record usage but do not block.
+- Compare estimated and actual cost.
+- Enable read-only mode after confidence.
 
 ---
 
-## Phase 4: Purchase Integration
+## 21. Security and Compliance Requirements
 
-### Tasks
-
-1. Configure App Store subscription products.
-2. Configure Play Store subscription products.
-3. Configure consumable credit packs.
-4. Implement mobile purchase provider.
-5. Implement backend purchase verification.
-6. Implement restore purchase flow.
-7. Implement purchase webhooks if using RevenueCat.
-8. Implement idempotent credit grants.
-9. Re-evaluate `family_billing_state` after every purchase event.
-
-### Acceptance criteria
-
-- Subscription purchase activates plan.
-- Monthly credits are granted after subscription activation.
-- Add-on credit purchase grants correct credits.
-- Duplicate purchase events do not duplicate credits.
-- Restore purchase refreshes entitlement.
-- Cancelled subscription falls back to Free Active.
+- Never store raw card/payment credentials.
+- Verify every provider webhook signature.
+- Store provider event IDs and enforce idempotency.
+- Audit every admin billing write.
+- Do not expose provider secrets to mobile.
+- Do not trust mobile confirmation without backend verification.
+- Minimize raw provider payload exposure in admin UI.
+- Avoid deleting subscription/payment rows during parent deletion until retention policy is confirmed.
+- Ensure parent account deletion covers or anonymizes billing references according to legal requirements.
 
 ---
 
-## Phase 5: Chat Metering Enforcement
+## 22. Operational Alerts
 
-### Tasks
+Add alerts for:
 
-1. Add safety classification before billing block.
-2. Add pre-chat entitlement check.
-3. Add credit reservation before normal generation.
-4. Add actual usage metering after AI response.
-5. Add ledger debit after usage calculation.
-6. Add reservation release on failure.
-7. Add usage limit reached response.
-8. Add safety response path for zero credits / read-only mode.
-
-### Acceptance criteria
-
-- Credits are charged based on actual usage.
-- Concurrent chats do not overspend wallet.
-- Failed model calls do not consume credits.
-- Usage-limit users are blocked from normal chat.
-- Safety-critical messages still receive safe handling.
-- Safety classifier is not disabled by any plan state.
+- webhook verification failures,
+- checkout session failures,
+- duplicate webhook events above threshold,
+- subscription update failures,
+- high cancellation rate,
+- high payment failure rate,
+- child-limit error spike,
+- provider API outage,
+- mismatch between provider state and local subscription state.
 
 ---
 
-## Phase 6: Notifications and Reporting
+## 23. Open Questions
 
-### Tasks
-
-1. Add low-credit notification.
-2. Add usage-limit reached notification.
-3. Add kid-limit reached notification.
-4. Add renewal notification.
-5. Add failed payment notification.
-6. Add billing reports.
-7. Add free-to-paid conversion report.
-
-### Acceptance criteria
-
-- Parent receives useful alerts.
-- Kids do not receive payment-related alerts.
-- Admin can track conversion, usage, kid-limit reached, and usage-limit reached.
+1. Is `starter` a free plan, a paid plan, or a 7-day trial plan?
+2. Which provider is the first real payment target: App Store, Play Store, Stripe, Razorpay, or another provider?
+3. Should mobile use `/billing/*` routes or mobile aliases like `/plans/family`?
+4. Are quarterly and annual cycles required for the first backend integration, or only monthly?
+5. Do subscriptions renew through app stores or external checkout?
+6. Should child profiles above a downgraded plan limit remain chat-enabled or become read-only?
+7. Are credit wallets required before production billing, or can child-limit subscriptions ship first?
+8. What is the legal retention policy for subscription and invoice data after parent deletion?
 
 ---
 
-## 26. Testing Plan
-
-### 26.1 Free plan tests
-
-| Scenario | Expected result |
-|---|---|
-| New parent signs up | `account_mode = FREE_ACTIVE`, free monthly credits granted |
-| Kid sends message | Credits deducted |
-| Free credits reach zero | `usage_limit_reached = true`, `message_write_mode = READ_ONLY` |
-| Account mode after free credits reach zero | Still `FREE_ACTIVE` |
-| Parent subscribes | `account_mode = SUBSCRIPTION_ACTIVE`, paid credits granted |
-| Paid subscription cancelled | Account falls back to `FREE_ACTIVE` |
-| Monthly reset occurs | Free credits refreshed for non-paid account |
-
-### 26.2 Kids limit tests
-
-| Scenario | Expected result |
-|---|---|
-| Free plan allows 1 kid, parent adds first kid | Success |
-| Free plan allows 1 kid, parent adds second kid | `KID_LIMIT_REACHED` |
-| Admin changes Free Plan max kids to 2 | Parent can add second kid after entitlement refresh |
-| Paid Plus allows 2 kids | Parent can add up to 2 kids |
-| Subscription cancelled and family has 2 kids but Free allows 1 | Existing profiles remain; extra access follows downgrade rule; no new kids allowed |
-
-### 26.3 Paid subscription tests
-
-| Scenario | Expected result |
-|---|---|
-| Parent buys Basic plan | Subscription active, credits granted |
-| Monthly credits exhausted | Add-on credits used if available |
-| No add-on credits | `usage_limit_reached = true`, read-only normal chat |
-| Parent buys add-on pack | `usage_limit_reached = false`, kid unlocked |
-| Renewal occurs | Monthly credits refreshed |
-| Payment fails | Grace/block rules applied, or fallback when expired |
-
-### 26.4 Safety tests
-
-| Scenario | Expected result |
-|---|---|
-| Free usage limit reached and kid sends normal message | Normal chat blocked, read-only response returned |
-| Free usage limit reached and kid sends high-risk message | Safety response returned |
-| Paid usage limit reached and kid sends high-risk message | Safety response returned |
-| Billing blocked but safety-critical event detected | Safety workflow still runs as per policy |
-
-### 26.5 Ledger tests
-
-| Scenario | Expected result |
-|---|---|
-| Grant free credits | Ledger has grant event |
-| Debit chat usage | Ledger has debit event |
-| Failed chat | Reservation released |
-| Duplicate purchase webhook | No duplicate grant |
-| Admin adjustment | Ledger has adjustment with reason |
-
-### 26.6 Mobile UI tests
-
-| Scenario | Expected result |
-|---|---|
-| `FREE_ACTIVE` + `usage_limit_reached=false` | Chat composer visible |
-| `FREE_ACTIVE` + `usage_limit_reached=true` | Read-only composer visible |
-| `SUBSCRIPTION_ACTIVE` + `usage_limit_reached=false` | Chat composer visible |
-| `SUBSCRIPTION_ACTIVE` + `usage_limit_reached=true` | Ask Parent button visible |
-| `kid_limit_reached=true` | Add kid flow shows upgrade prompt |
-| Parent PIN success | Billing screen opens |
-| Parent PIN fail | Billing screen blocked |
-
----
-
-## 27. Security and Abuse Controls
-
-### 27.1 Free plan abuse prevention
-
-Recommended controls:
-
-- Require verified parent email or phone before free usage.
-- Limit one free plan per parent account.
-- Track repeated signup patterns.
-- Track repeated device/account abuse signals.
-- Use admin-configured kids limit.
-- Voice off for Free Plan unless business approves it.
-
----
-
-### 27.2 Admin security
-
-- Billing admin actions should be RBAC-protected.
-- Credit adjustment should require reason.
-- Large adjustment should require approval.
-- Rate card activation should be audited.
-- Store product changes should be audited.
-- Plan content changes should be audited.
-- Kids limit changes should be audited.
-- Ledger should be immutable.
-
----
-
-## 28. Important Implementation Decisions
-
-### Decision 1
-
-Use credits as parent-facing unit, not tokens.
-
-### Decision 2
-
-Keep all billing configuration under Admin → Billing.
-
-### Decision 3
-
-Free Plan is the default entitlement for all non-paid users.
-
-### Decision 4
-
-Cancelled/expired paid users fall back to `FREE_ACTIVE`.
-
-### Decision 5
-
-Do not change account mode when limits are reached.
-
-### Decision 6
-
-Use `usage_limit_reached`, `kid_limit_reached`, and `message_write_mode` for limits.
-
-### Decision 7
-
-Kids allowed is admin-configurable for every plan.
-
-### Decision 8
-
-Plan card content is backend-owned.
-
-### Decision 9
-
-No model variation, model tiers, or model catalog in MVP billing.
-
-### Decision 10
-
-Safety is always enabled and never compromised by billing state.
-
-### Decision 11
-
-Monthly credits and add-on credits must be separate buckets.
-
-### Decision 12
-
-Use an immutable credit ledger.
-
-### Decision 13
-
-Backend is the source of truth for all entitlement and credit decisions.
-
-### Decision 14
-
-Mobile app should only display billing state and trigger purchases.
-
----
-
-## 29. Final Recommended Rule Set
-
-```text
-Every parent account always has a billing entitlement.
-
-If there is no active paid subscription:
-    Use default Free Plan.
-    account_mode = FREE_ACTIVE.
-
-If a paid subscription is cancelled or expired:
-    Fall back to default Free Plan.
-    account_mode = FREE_ACTIVE.
-
-If free credits are available:
-    usage_limit_reached = false.
-    message_write_mode = READ_WRITE.
-    Kid can chat normally.
-
-If free credits are exhausted:
-    account_mode remains FREE_ACTIVE.
-    usage_limit_reached = true.
-    message_write_mode = READ_ONLY.
-    Kid can read previous messages.
-    Parent is prompted to subscribe.
-
-If paid subscription is active:
-    account_mode = SUBSCRIPTION_ACTIVE.
-    Use paid monthly credits first.
-
-If paid monthly credits are exhausted:
-    Use add-on credits if available.
-
-If no usable credits remain:
-    account_mode does not change.
-    usage_limit_reached = true.
-    message_write_mode = READ_ONLY.
-    Parent can buy add-on credits or upgrade plan.
-
-If active kids count reaches plan max kids:
-    kid_limit_reached = true.
-    can_add_child = false.
-    Parent is prompted to upgrade.
-
-If the message is safety-critical:
-    Safety classifier and safe response workflow always run.
-    Billing must not block safety.
-
-Admin controls plans, free credits, kids allowed, plan content, credit packs, rate cards, usage rules, and ledger adjustments under Billing.
-```
-
----
-
-## 30. MVP Checklist
+## 24. Complete Task Checklist
 
 ### Backend
 
-- [ ] Plans table with backend-owned plan content
-- [ ] Default Free Plan support
-- [ ] Family billing state table
-- [ ] Usage limit reached flag
-- [ ] Kid limit reached flag
-- [ ] Subscription support
-- [ ] Credit packs
-- [ ] Credit buckets
-- [ ] Credit ledger
-- [ ] Global rate cards
-- [ ] Usage events
-- [ ] Entitlement API
-- [ ] Usage summary API
-- [ ] Plans API returning content
-- [ ] Credit packs API returning content
-- [ ] Purchase verification API
-- [ ] Chat credit enforcement
-- [ ] Kids limit enforcement
-- [ ] Monthly credit grant job
-- [ ] Read-only message mode response
-- [ ] Safety always-on flow
-
-### Admin
-
-- [ ] Billing menu
-- [ ] Plans screen
-- [ ] Free Plan screen
-- [ ] Credit Packs screen
-- [ ] Rate Cards screen
-- [ ] Subscriptions screen
-- [ ] Family Wallet screen
-- [ ] Usage Events screen
-- [ ] Credit Ledger screen
-- [ ] Adjustments screen
-- [ ] Store Products screen
-- [ ] Reports screen
-- [ ] Settings screen
-- [ ] Plan content editor
-- [ ] Kids allowed configuration
-- [ ] No Model Catalog screen for MVP
+- [ ] Centralize entitlement evaluation helper.
+- [ ] Add plan display fields to `billing_plans`.
+- [ ] Add checkout session table.
+- [ ] Add provider product mapping table.
+- [ ] Add webhook event table.
+- [ ] Expand `/billing/plans` response.
+- [ ] Expand `/billing/subscription` response with entitlement.
+- [ ] Add checkout session idempotency.
+- [ ] Add checkout confirmation endpoint with session ID.
+- [ ] Improve child-limit error details.
+- [ ] Add admin plan create/edit routes.
+- [ ] Add admin subscription search/history routes.
+- [ ] Add billing audit events.
+- [ ] Add provider webhook route.
+- [ ] Add provider sandbox integration.
+- [ ] Add tests.
 
 ### Mobile
 
-- [ ] Billing API client
-- [ ] Billing state management
-- [ ] Parent dashboard credit meter
-- [ ] Subscription screen wiring to backend content
-- [ ] Add credit screen wiring to backend content
-- [ ] Restore purchase flow
-- [ ] Kid read-only message mode
-- [ ] Ask Parent flow
-- [ ] Parent PIN gate
-- [ ] Add kid limit handling
-- [ ] Chat billing response handling
-- [ ] Low credit alerts
+- [ ] Add `billingApi.ts`.
+- [ ] Add `useBillingViewModel`.
+- [ ] Replace hardcoded payment plans.
+- [ ] Replace local `monthly/quarterly/annual` plan IDs with backend plan codes.
+- [ ] Fetch current subscription.
+- [ ] Create checkout session.
+- [ ] Confirm demo checkout.
+- [ ] Refresh dashboard after checkout.
+- [ ] Update confirmation screen.
+- [ ] Handle child-limit errors with upgrade CTA.
+- [ ] Remove offline-only checkout copy.
 
----
+### Admin
 
-## 31. Suggested Implementation Order
+- [ ] Build Billing overview.
+- [ ] Build plan management UI.
+- [ ] Build subscription search/history UI.
+- [ ] Add provider diagnostics UI.
+- [ ] Show audit history for support changes.
+- [ ] Add wallet/ledger screens after credit wallet phase.
 
-1. Update database schema and seed Free Plan.
-2. Add `family_billing_state` and evaluator.
-3. Build entitlement API.
-4. Build credit wallet and ledger.
-5. Build free plan monthly grant.
-6. Build kids allowed enforcement.
-7. Build admin Billing screens.
-8. Wire mobile parent dashboard to entitlement API.
-9. Wire mobile plan cards to backend plan content.
-10. Wire kid read-only message mode.
-11. Add purchase integration.
-12. Add usage metering and chat debit.
-13. Add safety-always-on path.
-14. Add notifications and reports.
-15. Run end-to-end QA.
-16. Release with conservative plan values first.
+### Future Wallet
 
----
-
-## 32. End-to-End Examples
-
-### 32.1 New free user
-
-```text
-Parent creates account
-→ Backend assigns default Free Plan
-→ account_mode = FREE_ACTIVE
-→ Backend grants 10 free credits
-→ Kid sends message
-→ Backend charges 1 credit
-→ Remaining credits = 9
-→ usage_limit_reached = false
-```
-
----
-
-### 32.2 Free user reaches usage limit
-
-```text
-Free credits reach 0
-→ account_mode remains FREE_ACTIVE
-→ usage_limit_reached = true
-→ message_write_mode = READ_ONLY
-→ Kid can read old messages
-→ Kid cannot send normal new messages
-→ Parent sees Subscribe CTA
-```
-
----
-
-### 32.3 Paid subscription cancelled
-
-```text
-Parent cancels Plus plan
-→ Subscription expires at period end
-→ Backend falls back to default Free Plan
-→ account_mode = FREE_ACTIVE
-→ Free Plan credits and kids limit apply
-→ Parent sees upgrade CTA
-```
-
----
-
-### 32.4 Parent subscribes
-
-```text
-Parent buys Plus plan
-→ Backend verifies purchase
-→ Subscription active
-→ account_mode = SUBSCRIPTION_ACTIVE
-→ Backend grants 50,000 monthly credits
-→ usage_limit_reached = false
-→ Kid chat unlocked
-```
-
----
-
-### 32.5 Paid user buys add-on credits
-
-```text
-Monthly credits exhausted
-→ Add-on credits unavailable
-→ usage_limit_reached = true
-→ Parent buys Medium Pack
-→ Backend grants 50,000 add-on credits
-→ usage_limit_reached = false
-→ Kid chat unlocked
-→ Add-on credits do not reset monthly
-```
-
----
-
-### 32.6 Kid limit reached
-
-```text
-Free Plan allows 1 kid
-→ Parent already has 1 kid profile
-→ Parent tries to add second kid
-→ Backend returns KID_LIMIT_REACHED
-→ account_mode remains FREE_ACTIVE
-→ kid_limit_reached = true
-→ Parent sees upgrade CTA
-```
-
----
-
-### 32.7 Safety after usage limit
-
-```text
-Free credits are 0
-→ usage_limit_reached = true
-→ Kid sends safety-critical message
-→ Backend runs safety classifier
-→ Backend returns safe response
-→ Parent safety workflow runs if required
-→ Normal billing does not block safety
-```
-
----
-
-## 33. Final Architecture Summary
-
-```text
-Mobile App
-  ↓
-Billing APIs
-  ↓
-Billing Entitlement Service
-  ↓
-Family Billing State Evaluator
-  ↓
-Credit Wallet + Ledger
-  ↓
-Global Rate Card + Usage Metering
-  ↓
-Chat / Voice / Safety Services
-  ↓
-Admin Billing Console
-```
-
-The clean separation is:
-
-```text
-Admin configures billing rules and plan content.
-Backend enforces billing rules.
-Backend always preserves safety behavior.
-Mobile displays billing state and backend-provided content.
-Parent pays and manages plans.
-Kid only sees safe, simple access states.
-```
+- [ ] Add credit bucket table.
+- [ ] Add usage event table.
+- [ ] Add credit ledger table.
+- [ ] Add credit pack table.
+- [ ] Record chat usage in shadow mode.
+- [ ] Add read-only entitlement mode.
+- [ ] Add admin wallet adjustment flow.
